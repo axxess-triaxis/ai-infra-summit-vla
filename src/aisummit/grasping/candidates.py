@@ -44,7 +44,7 @@ _POSITION_OFFSETS = (-0.015, 0.0, 0.015)  # meters, along the object's principal
 # candidates were rejected for 1-5cm table penetration). Lifting the
 # target a little is a grasp-planning decision, not a geometry-estimation
 # one, so it lives here rather than adjusting the authored handle height.
-_GRASP_HEIGHT_CLEARANCE = 0.015
+_GRASP_HEIGHT_CLEARANCE = 0.03
 # 15-degree steps rather than 30: the viable window that clears the table
 # while keeping decent finger-closing alignment turned out to be fairly
 # narrow (empirically ~70-90deg for this arm's geometry, found by sweeping
@@ -60,6 +60,7 @@ class GraspCandidate:
     target_quat: np.ndarray
     source: str  # human-readable provenance, e.g. "offset=+0.015,wrist=90deg"
     closing_axis_alignment: float  # 0..1, 1 = perfectly perpendicular to the object's axis
+    seed_angles: np.ndarray | None = None  # warm-start for the final 6-DOF solve -- see solve_ik's docstring
 
 
 def _finger_positions(model: mujoco.MjModel, data: mujoco.MjData, side: str) -> tuple[np.ndarray, np.ndarray]:
@@ -116,6 +117,11 @@ def generate_candidates(
             closing_axis = _horizontal_unit(right_finger - left_finger)
             alignment = 1.0 - abs(float(np.dot(closing_axis, axis_h)))
 
+            wrist_overridden_angles = np.array(
+                [scratch.qpos[model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{side}/{j}")]]
+                 for j in ARM_JOINTS]
+            )
+
             candidates.append(
                 GraspCandidate(
                     side=side,
@@ -123,6 +129,7 @@ def generate_candidates(
                     target_quat=quat,
                     source=f"offset={offset:+.3f},wrist={wrist_deg}deg",
                     closing_axis_alignment=alignment,
+                    seed_angles=wrist_overridden_angles,
                 )
             )
     return candidates

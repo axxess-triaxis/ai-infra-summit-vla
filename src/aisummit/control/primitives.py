@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from aisummit.control.ik import solve_ik
+from aisummit.control.ik import finger_target_to_site_target, solve_ik
 from aisummit.sim.env import ARM_JOINTS, DinnerTableEnv, Observation
 
 GRIPPER_OPEN = 0.037
@@ -51,12 +51,20 @@ def move_to(
 
 
 def move_to_pose(
-    env: DinnerTableEnv, ctrl: np.ndarray, side: str, target_xyz: np.ndarray, target_quat: np.ndarray
+    env: DinnerTableEnv, ctrl: np.ndarray, side: str, target_xyz: np.ndarray, target_quat: np.ndarray,
+    seed_angles: np.ndarray | None = None,
 ) -> tuple[np.ndarray, Observation]:
     """Orientation-aware counterpart to `move_to`, used by the grasp
     pipeline for elongated objects. `move_to` is untouched and still used
-    for radially symmetric objects -- see grasping/planner.py."""
-    angles = solve_ik(env.model, env.data, side, np.asarray(target_xyz), target_quat=target_quat)
+    for radially symmetric objects -- see grasping/planner.py.
+
+    `seed_angles` warm-starts the IK solve from a specific configuration
+    instead of the arm's actual current pose -- needed for far/twisted
+    targets where cold-start damped least-squares can fail to converge
+    even though a solution exists nearby (see solve_ik's docstring)."""
+    angles = solve_ik(
+        env.model, env.data, side, np.asarray(target_xyz), target_quat=target_quat, seed_angles=seed_angles
+    )
     ctrl = _set_arm_target(env, ctrl, side, angles)
     obs = None
     for _ in range(_ORIENTED_SETTLE_STEPS // _SUBSTEPS):
@@ -100,7 +108,7 @@ def place(
 
 def pick_oriented(
     env: DinnerTableEnv, ctrl: np.ndarray, side: str, target_xyz: np.ndarray, target_quat: np.ndarray,
-    lift_height: float = 0.12,
+    lift_height: float = 0.12, seed_angles: np.ndarray | None = None,
 ) -> tuple[np.ndarray, Observation]:
     """Same shape as `pick`, but drives a specific grasp pose (position +
     orientation) instead of always approaching an object's CoM from
@@ -115,13 +123,34 @@ def pick_oriented(
     (a kinematic "elbow flip"). This trades away the side-swipe protection
     a high approach gives `pick()`; `grasping/collision.py` covers the
     final pose, not the swept path, which is an accepted gap for the
-    current small demo scene -- see README known limitations."""
+    current small demo scene -- see README known limitations.
+
+    `target_xyz` here means the true intended FINGER-MIDPOINT position (the
+    grasp point), not the `{side}/gripper` site `move_to_pose` itself moves
+    -- `finger_target_to_site_target` converts between the two (see
+    control/ik.py's docstring for why they aren't the same point).
+
+    `seed_angles`, if given (grasping/candidates.py always provides one),
+    warm-starts the first solve -- a cold start from the arm's resting pose
+    can fail to converge for a far, heavily-twisted target even when one is
+    reachable (found via a real false positive during development: a
+    candidate judged collision-free and well-aligned was actually nowhere
+    near its target, because nothing had checked the solved pose's
+    position error). The lift step re-seeds from that same solution, which
+    is already close."""
     target_xyz = np.asarray(target_xyz)
     ctrl = set_gripper(env, ctrl, side, GRIPPER_OPEN)
-    ctrl, obs = move_to_pose(env, ctrl, side, target_xyz, target_quat)
+    ctrl, obs = move_to_pose(
+        env, ctrl, side, finger_target_to_site_target(target_xyz, target_quat), target_quat,
+        seed_angles=seed_angles,
+    )
     ctrl = set_gripper(env, ctrl, side, GRIPPER_CLOSED)
     obs = hold(env, ctrl)
-    ctrl, obs = move_to_pose(env, ctrl, side, target_xyz + np.array([0, 0, lift_height]), target_quat)
+    lift_target = target_xyz + np.array([0, 0, lift_height])
+    ctrl, obs = move_to_pose(
+        env, ctrl, side, finger_target_to_site_target(lift_target, target_quat), target_quat,
+        seed_angles=seed_angles,
+    )
     return ctrl, obs
 
 
@@ -133,10 +162,13 @@ def place_oriented(
     grasp orientation through descent (requirement: predictable object
     orientation during transport, particularly for knives). Single-stage
     descent for the same reason as `pick_oriented`: an intermediate
-    waypoint measurably hurt IK convergence for a twisted orientation."""
+    waypoint measurably hurt IK convergence for a twisted orientation.
+    `target_xyz` means the finger-midpoint target, same convention as
+    `pick_oriented` -- see its docstring."""
     target_xyz = np.asarray(target_xyz)
-    ctrl, obs = move_to_pose(env, ctrl, side, target_xyz, target_quat)
+    ctrl, obs = move_to_pose(env, ctrl, side, finger_target_to_site_target(target_xyz, target_quat), target_quat)
     ctrl = set_gripper(env, ctrl, side, GRIPPER_OPEN)
     obs = hold(env, ctrl, steps=30)
-    ctrl, obs = move_to_pose(env, ctrl, side, target_xyz + np.array([0, 0, retreat_height]), target_quat)
+    retreat_target = target_xyz + np.array([0, 0, retreat_height])
+    ctrl, obs = move_to_pose(env, ctrl, side, finger_target_to_site_target(retreat_target, target_quat), target_quat)
     return ctrl, obs

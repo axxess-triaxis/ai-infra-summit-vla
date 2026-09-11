@@ -27,6 +27,27 @@ _DAMPING = 0.05
 _STEP_SIZE = 0.5
 _TOLERANCE = 1e-3
 
+# The named `{side}/gripper` site is ALOHA's own TCP reference -- it does
+# NOT coincide with the actual midpoint between the two fingers. Calibrated
+# empirically (read both site and finger positions via forward kinematics,
+# transform the world-frame gap into the gripper site's own local frame)
+# and confirmed constant to 4 decimal places across a 120-degree
+# wrist_rotate sweep and identical for both arms (expected: same local
+# geometry, mirrored only at the base mount). This was invisible for the
+# cup (3cm radius >> 1.4cm offset) but fatal for the fork (1cm radius) --
+# see grasp-pipeline README section for how this was found.
+GRIPPER_SITE_TO_FINGER_MIDPOINT_OFFSET = np.array([-0.0138, 0.0, 0.0022])
+
+
+def finger_target_to_site_target(target_xyz: np.ndarray, target_quat: np.ndarray) -> np.ndarray:
+    """Converts a desired FINGER-MIDPOINT world position into the
+    `{side}/gripper` site target `solve_ik` actually needs, given the
+    orientation the gripper will be at."""
+    rot = np.zeros(9)
+    mujoco.mju_quat2Mat(rot, np.asarray(target_quat))
+    rot = rot.reshape(3, 3)
+    return np.asarray(target_xyz) - rot @ GRIPPER_SITE_TO_FINGER_MIDPOINT_OFFSET
+
 
 def _arm_dof_indices(model: mujoco.MjModel, side: str) -> list[int]:
     indices = []
@@ -60,13 +81,29 @@ def solve_ik(
     target_xyz: np.ndarray,
     target_quat: np.ndarray | None = None,
     max_iters: int = _MAX_ITERS,
+    seed_angles: np.ndarray | None = None,
 ) -> np.ndarray:
     """Returns the 6 target joint angles for `side`'s arm that bring its
     gripper site closest to `target_xyz` (and, if given, `target_quat`, a
-    world-frame quaternion in wxyz order). Does not mutate `data`."""
+    world-frame quaternion in wxyz order). Does not mutate `data`.
+
+    `seed_angles`, like `target_quat`, is optional and additive: omit it
+    and the solve starts from `data`'s actual current arm pose, exactly as
+    before. Pass it to warm-start from a different configuration instead --
+    needed for combined position+orientation solves reaching far, twisted
+    targets from a cold/neutral start, where damped least-squares can fail
+    to converge even though a solution exists nearby in configuration
+    space (found via a real failure: the right arm reaching across the
+    table for the fork, well within its kinematic reach and confirmed
+    reachable from a warm start, failed to converge from the resting
+    pose)."""
     scratch = mujoco.MjData(model)
     scratch.qpos[:] = data.qpos
     scratch.qvel[:] = data.qvel
+    if seed_angles is not None:
+        for k, joint_name in enumerate(ARM_JOINTS):
+            jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{side}/{joint_name}")
+            scratch.qpos[model.jnt_qposadr[jnt_id]] = seed_angles[k]
     mujoco.mj_forward(model, scratch)
 
     site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{side}/gripper")

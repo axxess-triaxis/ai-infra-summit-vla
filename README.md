@@ -147,25 +147,61 @@ estimate_object_geometry()  ->  generate_candidates()  ->  evaluate_candidate() 
   -- not force-enabled, since the current object set's widths don't naturally cross the
   low-stability trigger.
 
-**Two real bugs were found and fixed during this work** (both documented with root cause in
-the implementation writeup, not just patched silently): `collision.py` originally never
-checked collisions against the table/floor itself, only other tableware; and the original
-two-waypoint "approach then descend" pattern (copied from `pick()`) measurably *hurt* IK
-convergence for twisted, non-top-down orientations (a kinematic elbow-flip effect) --
-`pick_oriented`/`place_oriented` now move directly to the grasp pose in one stage.
+**Six real bugs were found and fixed while getting this reliable**, each root-caused via
+direct physics inspection (contact lists, joint tracking error, forward-kinematics offsets),
+not guessed:
+
+1. `collision.py` originally never checked collisions against the table/floor itself, only
+   other tableware.
+2. The original two-waypoint "approach then descend" pattern (copied from `pick()`) measurably
+   *hurt* IK convergence for twisted, non-top-down orientations (a kinematic elbow-flip
+   effect) -- `pick_oriented`/`place_oriented` now move directly to the grasp pose in one stage.
+3. **The named `{side}/gripper` site IK targets is not the same point as the actual
+   finger-closing midpoint** -- a fixed ~1.4cm mechanical offset (calibrated empirically,
+   confirmed constant across a 120-degree wrist sweep and identical for both arms; see
+   `control/ik.py::GRIPPER_SITE_TO_FINGER_MIDPOINT_OFFSET`). Invisible for the cup (3cm radius
+   swallows a 1.4cm error) but larger than the fork's entire half-width -- the single biggest
+   reason early grasp attempts silently missed. `finger_target_to_site_target()` converts a
+   true finger-midpoint target into the site target `solve_ik` needs.
+4. **Cold-start IK can fail to converge for a far, heavily-twisted target that a warm-started
+   solve reaches easily.** Found via a real false positive: a candidate that scored as
+   collision-free and well-aligned was actually nowhere near its intended target, because the
+   check that "confirmed" it only verified collision-freedom, not position error. `solve_ik`
+   gained an optional `seed_angles` (additive, same pattern as `target_quat`); `generate_candidates`
+   now stores each candidate's own wrist-swept seed configuration and every downstream solve
+   (scoring, execution) warm-starts from it.
+5. **Authored object heights aren't resting-contact height** -- the fork/knife/plate start
+   ~1.6cm above the table and settle under gravity within ~50 physics steps; geometry
+   estimated immediately after `reset()` (before any arm motion) was stale by the time the arm
+   actually got there. Fixed with `DinnerTableEnv.settle()`, called only from the
+   elongated-object grasp path -- **not** from `reset()` itself, because doing so shifted the
+   cup regression test's exact numbers enough to expose a separate, pre-existing fragility in
+   `place()`'s release/retreat step. Keeping `reset()` untouched for the radial path and
+   settling only where nothing previously depended on the un-settled state is what let this
+   land without breaking the cup.
+6. A **grasp-height clearance margin** (added to give the gripper mechanism vertical clearance
+   from the table at wide wrist angles) had been implicitly tuned against the *stale* fork
+   height from bug 5 -- once that was fixed, the same clearance constant needed retuning
+   against the real, lower height.
 
 ## Known limitations (stated plainly, not hidden)
 
-- **Full physical grasp success on the fork/knife is not yet reliable.** The reasoning
-  pipeline above is real, tested, and correctly executes every stage (geometry -> candidates
-  -> scoring -> IK/collision filtering -> execution -> verification -> retry across multiple
-  distinct candidates, confirmed by `test_grasp_retries_multiple_distinct_candidates_without_repeating`),
-  but for this arm's specific kinematics and the fork's current table position, the window of
-  wrist orientations that are simultaneously (a) well-aligned for a perpendicular grip and (b)
-  clear of the table turned out to be very narrow (a few degrees), and the position-actuator
-  PD gains settle slowly into strongly twisted poses. The cup and plate grasp reliably. See
-  "Fastest additional improvements" in the implementation writeup for the concrete next steps
-  (finer/adaptive wrist search, or a side-approach rather than top-down for thin flat objects).
+- **Full physical grasp success on the fork/knife is still not reliable**, even after all six
+  fixes above closed roughly a 4-14cm position error down to about 1cm. The reasoning pipeline
+  itself is real, tested, and correct at every stage (geometry -> candidates -> scoring ->
+  IK/collision filtering -> execution -> verification -> retry across many distinct
+  candidates without repeating one, confirmed by
+  `test_grasp_retries_multiple_distinct_candidates_without_repeating`) -- what remains
+  unreliable is the last centimeter of physical precision on an object only 1cm across. The
+  latest diagnosis: the wrist angle that achieves good *horizontal* finger-perpendicular
+  alignment (measured by projecting the closing axis onto the table plane) also tilts the
+  gripper noticeably off-level in the vertical axis -- the two fingers end up several
+  centimeters apart in height when closing on a 4mm-thick object, which the current alignment
+  metric doesn't penalize because it only checks the horizontal projection. The cup and plate
+  grasp reliably throughout all of this (never broke, verified after every change above).
+  Fastest next step: extend the alignment score to also penalize finger-height mismatch, so
+  candidate selection stops picking orientations that are horizontally great but vertically
+  tilted.
 - **Speechmatics integration is unverified.** Implemented from documented protocol knowledge,
   not tested against a live key. Confirm the auth flow (bearer key vs. short-lived JWT
   exchange) and endpoint region before the actual demo.

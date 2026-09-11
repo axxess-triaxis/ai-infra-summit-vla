@@ -97,8 +97,15 @@ def evaluate_candidate(
         scratch.qpos[model.jnt_qposadr[jnt_id]] = solved_angles[j]
     mujoco.mj_forward(model, scratch)
 
+    # Compare against the actual finger-closing midpoint, not the
+    # `{side}/gripper` site -- they're ~1.4cm apart (see ik.py's
+    # GRIPPER_SITE_TO_FINGER_MIDPOINT_OFFSET docstring), which is what was
+    # silently sinking every fork/knife grasp attempt before this was found.
+    left_finger_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{candidate.side}/left_finger")
+    right_finger_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{candidate.side}/right_finger")
+    achieved_pos = (scratch.site(left_finger_id).xpos + scratch.site(right_finger_id).xpos) / 2
+
     site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{candidate.side}/gripper")
-    achieved_pos = scratch.site(site_id).xpos
     achieved_quat = np.zeros(4)
     mujoco.mju_mat2Quat(achieved_quat, scratch.site(site_id).xmat)
 

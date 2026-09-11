@@ -64,6 +64,21 @@ class DinnerTableEnv:
         mujoco.mj_forward(self.model, self.data)
         return self._observe()
 
+    def settle(self, steps: int = 60) -> Observation:
+        """Steps physics with the arms held at their current ctrl so
+        free-jointed objects reach their true resting contact height.
+        Authored object heights aren't exactly that (the fork/knife/plate
+        start ~1.6cm above the table, the cup slightly interpenetrating it)
+        -- not called from `reset()` itself because doing so shifted the
+        cup regression test's exact numbers enough to expose a separate,
+        pre-existing fragility in `place()`'s release/retreat step (not
+        touched here, per "preserve currently working functionality").
+        `grasping/planner.py` calls this before estimating geometry for the
+        elongated-object path, which has no prior behavior to preserve."""
+        for _ in range(steps):
+            mujoco.mj_step(self.model, self.data)
+        return self._observe()
+
     def step(self, ctrl: np.ndarray, n_substeps: int = 5) -> Observation:
         assert ctrl.shape == (self.model.nu,), f"expected ctrl shape ({self.model.nu},), got {ctrl.shape}"
         self.data.ctrl[:] = ctrl

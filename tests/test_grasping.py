@@ -10,17 +10,18 @@ symmetric regression case (cup) separately and is left untouched.
 
 from __future__ import annotations
 
+import mujoco
 import numpy as np
 import pytest
 
-from aisummit.control.ik import solve_ik
+from aisummit.control.ik import finger_target_to_site_target, solve_ik
 from aisummit.grasping.candidates import generate_candidates
 from aisummit.grasping.collision import check_collision
 from aisummit.grasping.debug import GraspDebugTrace
 from aisummit.grasping.geometry import estimate_object_geometry
 from aisummit.grasping.planner import grasp_object, stabilize_with_other_arm
 from aisummit.grasping.scoring import GraspWeights, evaluate_candidate
-from aisummit.sim.env import DinnerTableEnv
+from aisummit.sim.env import ARM_JOINTS, DinnerTableEnv
 
 
 @pytest.fixture
@@ -155,4 +156,73 @@ def test_stabilizer_arm_moves_toward_the_object(env):
     assert np.linalg.norm(after - before) > 0.05, "stabilizer arm didn't actually move"
     assert np.linalg.norm(after[:2] - geometry.position[:2]) < 0.25, (
         "stabilizer arm didn't move toward the object"
+    )
+
+
+def test_finger_target_to_site_target_corrects_a_real_offset(env):
+    """Regression test for the single highest-impact bug found while tuning
+    this pipeline: the `{side}/gripper` site IK targets is ~1.4cm away from
+    the true finger-closing midpoint (a fixed mechanical offset -- see
+    ik.py's GRIPPER_SITE_TO_FINGER_MIDPOINT_OFFSET docstring). That's inside
+    the tolerance for the cup (3cm radius) but larger than the fork's whole
+    half-width (1cm), which is what silently sank every early grasp attempt.
+    Solving IK straight for a finger-target position (uninformed of the
+    offset) should land the true finger midpoint noticeably farther from
+    that target than solving for the *converted* site target does."""
+    target = env.body_xpos("fork") + np.array([0.0, 0.0, 0.05])
+    quat = np.array([1.0, 0.0, 0.0, 0.0])
+
+    def finger_midpoint_after_solving_for(site_target: np.ndarray) -> np.ndarray:
+        angles = solve_ik(env.model, env.data, "left", site_target, target_quat=quat)
+        scratch = mujoco.MjData(env.model)
+        scratch.qpos[:] = env.data.qpos
+        for j, joint_name in enumerate(ARM_JOINTS):
+            jnt_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, f"left/{joint_name}")
+            scratch.qpos[env.model.jnt_qposadr[jnt_id]] = angles[j]
+        mujoco.mj_forward(env.model, scratch)
+        left_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_SITE, "left/left_finger")
+        right_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_SITE, "left/right_finger")
+        return (scratch.site(left_id).xpos + scratch.site(right_id).xpos) / 2
+
+    naive_error = np.linalg.norm(finger_midpoint_after_solving_for(target) - target)
+    corrected_target = finger_target_to_site_target(target, quat)
+    corrected_error = np.linalg.norm(finger_midpoint_after_solving_for(corrected_target) - target)
+
+    assert corrected_error < 0.01, f"corrected solve still {corrected_error:.4f}m off"
+    assert naive_error > corrected_error + 0.005, (
+        "the offset correction should measurably beat solving for the raw target"
+    )
+
+
+def test_warm_start_reaches_targets_a_cold_start_misses(env):
+    """Regression test for the second highest-impact bug: a cold-start IK
+    solve (from the arm's resting pose) can fail to converge for a
+    far/twisted target that a warm-started solve, from a configuration
+    already close to the answer, reaches easily -- found via a real false
+    positive where a candidate looked collision-free only because it had
+    silently failed to converge to anywhere near its intended target."""
+    geometry = estimate_object_geometry(env.model, env.data, "fork")
+    candidates = generate_candidates(env.model, env.data, "left", geometry)
+    hard_candidate = next(c for c in candidates if c.source == "offset=+0.000,wrist=90deg")
+
+    site_target = finger_target_to_site_target(hard_candidate.target_position, hard_candidate.target_quat)
+    cold = solve_ik(env.model, env.data, "left", site_target, target_quat=hard_candidate.target_quat)
+    warm = solve_ik(
+        env.model, env.data, "left", site_target, target_quat=hard_candidate.target_quat,
+        seed_angles=hard_candidate.seed_angles,
+    )
+
+    def position_error(angles: np.ndarray) -> float:
+        scratch = mujoco.MjData(env.model)
+        scratch.qpos[:] = env.data.qpos
+        for j, joint_name in enumerate(ARM_JOINTS):
+            jnt_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, f"left/{joint_name}")
+            scratch.qpos[env.model.jnt_qposadr[jnt_id]] = angles[j]
+        mujoco.mj_forward(env.model, scratch)
+        site_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_SITE, "left/gripper")
+        return float(np.linalg.norm(scratch.site(site_id).xpos - site_target))
+
+    assert position_error(warm) < 0.01, "warm-started solve should converge closely"
+    assert position_error(cold) > position_error(warm) + 0.02, (
+        "warm start should measurably beat a cold start on this hard target"
     )
