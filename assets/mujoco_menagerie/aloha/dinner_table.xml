@@ -1,0 +1,36 @@
+<mujoco model="dinner_table">
+  <!-- This file is ours, colocated with ALOHA's own scene.xml (not part of
+       the vendored mujoco_menagerie checkout) so mesh/texture relative paths
+       resolve correctly -- MuJoCo resolves them against the outermost file's
+       directory, which breaks across a cross-folder <include>. -->
+  <include file="scene.xml"/>
+
+  <asset>
+    <material name="plate_mat" rgba="0.92 0.92 0.90 1"/>
+    <material name="fork_mat" rgba="0.75 0.76 0.78 1"/>
+    <material name="knife_mat" rgba="0.70 0.71 0.73 1"/>
+    <material name="cup_mat" rgba="0.55 0.75 0.85 1"/>
+  </asset>
+
+  <worldbody>
+    <body name="plate" pos="0 0.05 0.02">
+      <freejoint name="plate_free"/>
+      <geom name="plate_geom" type="cylinder" size="0.10 0.005" material="plate_mat" mass="0.15"/>
+    </body>
+
+    <body name="fork" pos="-0.22 0.05 0.02">
+      <freejoint name="fork_free"/>
+      <geom name="fork_geom" type="box" size="0.01 0.09 0.004" material="fork_mat" mass="0.03"/>
+    </body>
+
+    <body name="knife" pos="0.22 0.05 0.02">
+      <freejoint name="knife_free"/>
+      <geom name="knife_geom" type="box" size="0.008 0.10 0.004" material="knife_mat" mass="0.03"/>
+    </body>
+
+    <body name="cup" pos="0.30 0.20 0.03">
+      <freejoint name="cup_free"/>
+      <geom name="cup_geom" type="cylinder" size="0.03 0.045" material="cup_mat" mass="0.08"/>
+    </body>
+  </worldbody>
+</mujoco>
