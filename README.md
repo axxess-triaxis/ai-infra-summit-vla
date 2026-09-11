@@ -287,14 +287,62 @@ that faking a success when no feasible candidate exists is worse than reporting 
 result, and every avenue this pipeline currently searches (wrist orientation, grasp height,
 horizontal position, both arms) converges on the same conclusion.
 
-**Next geometric intervention** (not attempted here -- out of this iteration's scope, which was
-horizontal position only): decouple "approach clearance for table avoidance" from "final close
-height" in `pick_oriented`, most plausibly via a controlled *translation-only* final descent
-after the orientation is already locked in (translation-only should not reintroduce the
-elbow-flip a full 6-DOF two-waypoint solve caused previously, since the hard part --
-orientation -- would already be solved before descending). This is a real code change to
-`control/primitives.py`, not a scoring or search-space tweak, which is why it wasn't done as
-part of a "search object/approach position" task.
+**Next geometric intervention**, implemented and measured in the following iteration: decouple
+"approach clearance for table avoidance" from "final close height" via a controlled
+translation-only final descent.
+
+## Translation-only final descent
+
+Implemented exactly the intervention flagged above. `pick_oriented` gains an optional
+`final_target_xyz`: after the existing single-stage approach (position + orientation, unchanged),
+a SECOND move -- same `target_quat`, warm-started from the arm's own just-settled joint angles
+(`_current_arm_angles`, not the original `seed_angles`) rather than a fresh orientation search --
+translates down to the object's real height before closing. `GraspCandidate` gained a matching
+`final_target_position` (same horizontal point as `target_position`, at `geometry.grasp_region`'s
+real height instead of the clearance-elevated one), computed once in `generate_candidates`
+alongside the existing approach point. `_solve_matching_execution` (planner.py) mirrors the same
+two-stage solve so scoring stays predictive of what execution does -- `evaluate_candidate`'s
+position error and workspace-margin checks now compare against `final_target_position` when set,
+since `solved_angles` represents the post-descent pose, not the approach pose.
+
+**Result, measured directly:** the descent works exactly as intended -- it eliminates the reach
+failure entirely. Every rejection reason for both fork and knife, on both arms, changed from
+"neither finger reaches the object" to "arm would penetrate the table/floor". That's real
+progress: the pipeline no longer confuses "too high to reach" with "genuinely can't grasp this,"
+and the diagnostic is now precise about which of the two is actually happening. What it did not
+do is produce a feasible grasp -- the pre-existing collision-vs-alignment conflict (well-aligned
+wrist angles put the gripper body into the table) was never about height offset, and remains:
+
+```
+fork  / left:  185 evaluated, 75 IK-converged, 0 feasible -- best: align=0.80, mismatch=9.2mm, penetration=-21.2mm
+fork  / right: 185 evaluated, 12 IK-converged, 0 feasible -- best: align=0.00, mismatch=0.0mm,  penetration=-5.7mm
+knife / left:  185 evaluated, 100 IK-converged, 0 feasible -- best: align=0.00, mismatch=0.0mm, penetration=-12.5mm
+knife / right: 185 evaluated, 10 IK-converged, 0 feasible -- best: align=0.80 (wrist 175deg for right arm's chain), mismatch=0.8mm, penetration=-21.1mm
+```
+
+Every entry with meaningful alignment (>0.5) still collides with the table by 2-2.1cm --
+consistent with the earlier finding that raising or lowering the target height only trades reach
+failure for collision failure, never resolves both together, for this arm's kinematics at this
+grasp position. The descent was the right fix for the problem it targeted (height offset); it
+was never expected to fix a different, already-identified problem (the collision/alignment
+coupling itself), and it didn't. Both problems being cleanly separated now (rather than one
+masking the other) is the concrete gain from this iteration. No physical grasp attempt was run
+for the same reason as before: no candidate is feasible to attempt.
+
+Tests: 20/20 passing. Two adjustments were needed to keep pre-existing tests meaningful under the
+now-more-accurate diagnostic (not weakened): a shared test helper (`_solved_angles`) was updated
+to delegate to the real `_solve_matching_execution` instead of reimplementing a since-outdated
+single-stage version, and the knife handle-preference test dropped its `collision_valid`
+requirement (now uniformly false for every converged knife candidate, a separate finding from
+what that test checks) in favor of `ik_ok` alone, plus an added `env.settle()` call it had been
+missing.
+
+**Remaining highest-value intervention**: the collision-vs-alignment conflict itself. The
+gripper BODY (not the fingers) penetrates the table at well-aligned wrist angles regardless of
+close height -- worth checking whether a different wrist axis convention, or accepting a lower
+alignment target with a wider tolerance, or a fundamentally different approach vector (e.g.
+sweeping the elbow/shoulder configuration, not just wrist_rotate and horizontal position) could
+find a configuration this pipeline hasn't sampled yet.
 
 - **Speechmatics integration is unverified.** Implemented from documented protocol knowledge,
   not tested against a live key. Confirm the auth flow (bearer key vs. short-lived JWT

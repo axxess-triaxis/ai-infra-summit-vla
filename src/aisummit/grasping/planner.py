@@ -57,31 +57,41 @@ def _verify_lifted(env: DinnerTableEnv, obs: Observation, object_name: str, side
 
 
 def _solve_matching_execution(env: DinnerTableEnv, side: str, candidate: GraspCandidate) -> np.ndarray:
-    """Solves IK exactly the way `pick_oriented` will actually execute --
-    a single direct solve straight to the grasp pose, warm-started from the
-    candidate's own seed configuration, no intermediate waypoint.
+    """Solves IK exactly the way `pick_oriented` will actually execute, so
+    scoring/collision-checking is predictive of what execution actually
+    does. `pick_oriented`'s approach step is a single direct solve (no
+    intermediate waypoint chained through a *different* orientation, which
+    measurably hurt convergence -- a kinematic elbow flip); cold-start
+    (from the arm's resting pose) also failed to converge for far/twisted
+    candidates that a warm-started solve reaches easily -- found via a real
+    false positive: a candidate that looked collision-free and well-aligned
+    on paper was actually sitting nowhere near its intended target, because
+    nothing had checked the *solved* pose's position residual.
 
-    Two things had to be fixed to make this trustworthy: an earlier version
-    chained through a high-approach waypoint first (mirroring an earlier
-    `pick_oriented`), which measurably hurt convergence (a kinematic elbow
-    flip) -- `pick_oriented` moved to a single-stage approach for exactly
-    that reason. Separately, solving cold-start (from the arm's resting
-    pose) failed to converge for far/twisted candidates that a warm-started
-    solve reaches easily -- found via a real false positive: a candidate
-    that looked collision-free and well-aligned on paper was actually
-    sitting nowhere near its intended target, because nothing had checked
-    the *solved* pose's position residual, only whether it collided with
-    anything. Keeping both the waypoint structure and the seed in lockstep
-    with `pick_oriented` is what makes scoring/collision-checking
-    predictive of what execution actually does.
+    Mirrors `pick_oriented`'s translation-only final descent too, when
+    `candidate.final_target_position` is set: a second solve, SAME
+    `target_quat`, warm-started from the approach solve's own result --
+    matching `pick_oriented`'s use of the arm's just-settled angles as
+    closely as a static (non-physics) solve can. Returns that final,
+    post-descent configuration, since that's what the arm will actually be
+    at when the gripper closes -- scoring finger positions from the
+    approach configuration would evaluate a pose the arm never closes at.
 
-    `candidate.target_position` is the true finger-midpoint grasp point --
-    converted to the `{side}/gripper` site target `solve_ik` needs via
-    `finger_target_to_site_target`."""
-    site_target = finger_target_to_site_target(candidate.target_position, candidate.target_quat)
-    return solve_ik(
-        env.model, env.data, side, site_target, target_quat=candidate.target_quat,
+    `candidate.target_position`/`final_target_position` are the true
+    finger-midpoint grasp points -- converted to the `{side}/gripper` site
+    target `solve_ik` needs via `finger_target_to_site_target`."""
+    approach_site_target = finger_target_to_site_target(candidate.target_position, candidate.target_quat)
+    approach_solved = solve_ik(
+        env.model, env.data, side, approach_site_target, target_quat=candidate.target_quat,
         seed_angles=candidate.seed_angles,
+    )
+    if candidate.final_target_position is None:
+        return approach_solved
+
+    descent_site_target = finger_target_to_site_target(candidate.final_target_position, candidate.target_quat)
+    return solve_ik(
+        env.model, env.data, side, descent_site_target, target_quat=candidate.target_quat,
+        seed_angles=approach_solved,
     )
 
 
@@ -192,7 +202,8 @@ def grasp_object(
     final_obs = None
     for _, cand, _ in scored:
         ctrl, final_obs = pick_oriented(
-            env, ctrl, side, cand.target_position, cand.target_quat, seed_angles=cand.seed_angles
+            env, ctrl, side, cand.target_position, cand.target_quat, seed_angles=cand.seed_angles,
+            final_target_xyz=cand.final_target_position,
         )
         verified = _verify_lifted(env, final_obs, object_name, side, start_height)
         trace.record_attempt(AttemptTrace(cand.source, verified))

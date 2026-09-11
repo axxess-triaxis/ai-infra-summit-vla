@@ -44,6 +44,17 @@ world Y/X, so a separate world-frame sweep would just re-run the same
 numbers under different labels -- the object-relative axes are the
 general mechanism (they still work if that assumption stops holding for
 a future rotated object), not a fork-specific shortcut.
+
+Approach point vs. real close point: `target_position` includes
+`_GRASP_HEIGHT_CLEARANCE`, needed for the gripper BODY to clear the table
+at wide wrist angles -- but that same clearance was found to also lift
+the FINGERS well above the object, since `pick_oriented` never used to
+come back down before closing (measured directly: ~30mm above the fork's
+real surface, for every candidate, regardless of wrist angle or spatial
+offset). Each candidate now also carries `final_target_position` -- the
+same horizontal point at the object's real, un-elevated height --
+which `pick_oriented`'s translation-only final descent uses to actually
+close on the object instead of well above it.
 """
 
 from __future__ import annotations
@@ -102,12 +113,13 @@ def _spatial_offsets(
 @dataclass
 class GraspCandidate:
     side: str
-    target_position: np.ndarray
+    target_position: np.ndarray  # approach point -- includes _GRASP_HEIGHT_CLEARANCE for table clearance
     target_quat: np.ndarray
     source: str  # human-readable provenance, e.g. "long=+0.015,trans=+0.000,wrist=90deg"
     closing_axis_alignment: float  # 0..1, 1 = perfectly perpendicular to the object's axis
     longitudinal_offset: float = 0.0  # meters, along the object's principal axis
     transverse_offset: float = 0.0  # meters, along the object's transverse axis
+    final_target_position: np.ndarray | None = None  # the real close point, no clearance -- see control/primitives.py::pick_oriented
     seed_angles: np.ndarray | None = None  # warm-start for the final 6-DOF solve -- see solve_ik's docstring
 
 
@@ -142,8 +154,8 @@ def generate_candidates(
     transverse_offsets: tuple[float, ...] = _TRANSVERSE_OFFSETS,
     wrist_sweep_deg: tuple[float, ...] = _WRIST_SWEEP_DEG,
 ) -> list[GraspCandidate]:
-    base_point = geometry.grasp_region if geometry.grasp_region is not None else geometry.position
-    base_point = base_point + np.array([0, 0, _GRASP_HEIGHT_CLEARANCE])
+    real_close_point = geometry.grasp_region if geometry.grasp_region is not None else geometry.position
+    base_point = real_close_point + np.array([0, 0, _GRASP_HEIGHT_CLEARANCE])
     axis_h = _horizontal_unit(geometry.principal_axis)
     trans_h = transverse_axis_h(geometry)
     wrist_jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{side}/wrist_rotate")
@@ -151,7 +163,14 @@ def generate_candidates(
 
     candidates: list[GraspCandidate] = []
     for lon_offset, trans_offset in _spatial_offsets(longitudinal_offsets, transverse_offsets):
-        target_pos = base_point + lon_offset * axis_h + trans_offset * trans_h
+        horizontal_offset = lon_offset * axis_h + trans_offset * trans_h
+        target_pos = base_point + horizontal_offset
+        # Same horizontal position as the approach point, at the object's
+        # real height instead of the clearance-elevated one -- what
+        # pick_oriented's translation-only final descent actually closes
+        # on (see its docstring for why the approach point alone isn't the
+        # real close height).
+        final_target_pos = real_close_point + horizontal_offset
         seed_angles = solve_ik(model, data, side, target_pos)  # unmodified position-only IK, reused as-is
 
         for wrist_deg in wrist_sweep_deg:
@@ -181,6 +200,7 @@ def generate_candidates(
                     closing_axis_alignment=alignment,
                     longitudinal_offset=lon_offset,
                     transverse_offset=trans_offset,
+                    final_target_position=final_target_pos,
                     seed_angles=wrist_overridden_angles,
                 )
             )

@@ -142,7 +142,16 @@ def evaluate_candidate(
     achieved_quat = np.zeros(4)
     mujoco.mju_mat2Quat(achieved_quat, scratch.site(site_id).xmat)
 
-    pos_err = float(np.linalg.norm(achieved_pos - candidate.target_position))
+    # When a candidate has a translation-only final descent
+    # (final_target_position), `solved_angles` is the POST-descent
+    # configuration (see planner.py's _solve_matching_execution) -- so the
+    # achieved pose must be compared against where the arm actually closes,
+    # not the higher approach point it passed through on the way there.
+    intended_position = (
+        candidate.final_target_position if candidate.final_target_position is not None
+        else candidate.target_position
+    )
+    pos_err = float(np.linalg.norm(achieved_pos - intended_position))
     quat_err_vec = np.zeros(3)
     mujoco.mju_subQuat(quat_err_vec, candidate.target_quat, achieved_quat)
     orient_err = float(np.linalg.norm(quat_err_vec))
@@ -157,7 +166,7 @@ def evaluate_candidate(
     config_distance_score = float(np.clip(1.0 - config_distance / np.pi, 0.0, 1.0))
 
     base_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{candidate.side}/base_link")
-    reach_dist = float(np.linalg.norm(candidate.target_position - data.xpos[base_body_id]))
+    reach_dist = float(np.linalg.norm(intended_position - data.xpos[base_body_id]))
     workspace_margin = float(np.clip(1.0 - reach_dist / _NOMINAL_MAX_REACH_M, 0.0, 1.0))
 
     # A wrist angle can score well on horizontal closing-axis alignment
