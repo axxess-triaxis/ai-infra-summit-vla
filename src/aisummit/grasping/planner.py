@@ -188,6 +188,8 @@ def grasp_object(
     if trace.selected is None:
         best_source = scored[0][1].source
         trace.selected = next(c for c in trace.candidates if c.source == best_source)
+        if trace.verbose:
+            trace.print_selected_summary()
 
     final_obs = None
     for _, cand, _ in scored:

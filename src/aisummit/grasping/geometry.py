@@ -38,6 +38,7 @@ class ObjectGeometry:
     principal_axis: np.ndarray  # unit vector, world frame
     half_length: float  # half-extent along principal_axis (m)
     radius: float  # characteristic cross-section half-extent/radius (m)
+    thickness: float  # half-extent along the SHORTEST axis (m) -- see below
     is_elongated: bool
     grasp_region: np.ndarray | None  # world xyz of the authored handle site, if any
     grasp_region_confidence: float  # 1.0 if an authored handle site exists, else 0.5 (CoM fallback)
@@ -71,6 +72,14 @@ def estimate_object_geometry(
         local_axis = np.array([0.0, 0.0, 1.0])  # cylinder axis is local z
         half_length = float(size[1])
         radius = float(size[0])
+        # A cylinder has no distinct "flat" dimension the way a box does --
+        # its cross-section is round in every direction perpendicular to
+        # the axis. No elongated cylinder exists in the current object set
+        # to calibrate against, so this falls back to radius (a rod's
+        # cross-section is at least `radius` wide in any direction, so a
+        # same-order finger-height tolerance is a reasonable default, not
+        # a verified one).
+        thickness = radius
         is_elongated = half_length > _ELONGATION_RATIO * radius
     elif geom_type == mujoco.mjtGeom.mjGEOM_BOX:
         order = np.argsort(size)[::-1]  # longest half-extent first
@@ -79,6 +88,7 @@ def estimate_object_geometry(
         local_axis[order[0]] = 1.0
         half_length = float(longest)
         radius = float(second)
+        thickness = float(size[order[2]])  # shortest half-extent -- the fork/knife's flat dimension
         is_elongated = longest > _ELONGATION_RATIO * second
     else:
         raise ValueError(f"Unsupported geom type {geom_type} for {object_name!r}")
@@ -96,6 +106,7 @@ def estimate_object_geometry(
         principal_axis=world_axis,
         half_length=half_length,
         radius=radius,
+        thickness=thickness,
         is_elongated=is_elongated,
         grasp_region=grasp_region,
         grasp_region_confidence=1.0 if grasp_region is not None else 0.5,

@@ -45,12 +45,18 @@ _POSITION_OFFSETS = (-0.015, 0.0, 0.015)  # meters, along the object's principal
 # target a little is a grasp-planning decision, not a geometry-estimation
 # one, so it lives here rather than adjusting the authored handle height.
 _GRASP_HEIGHT_CLEARANCE = 0.03
-# 15-degree steps rather than 30: the viable window that clears the table
-# while keeping decent finger-closing alignment turned out to be fairly
-# narrow (empirically ~70-90deg for this arm's geometry, found by sweeping
-# 10-degree steps during debugging) -- 30-degree steps skipped over it
-# entirely. Still cheap: this is deterministic FK, not an LLM call.
-_WRIST_SWEEP_DEG = tuple(range(0, 181, 15))  # degrees; 180 deg-periodic for a parallel gripper
+# 5-degree steps rather than 15: at 15-degree resolution, the only nearby
+# sample points to the good-alignment region (75, 90) either penetrate the
+# table or -- found the hard way -- fail to converge to anywhere near the
+# target at all (a candidate that LOOKED like a great compromise, good
+# alignment with near-zero finger-height mismatch, turned out on inspection
+# to be a completely different, non-converged arm pose off in space; its
+# "good" mismatch was meaningless because the whole solve was wrong). At
+# 5-degree resolution a genuinely convergent, collision-free point with
+# both decent alignment and low finger-height mismatch exists nearby.
+# Still cheap and deterministic FK/IK, not an LLM call -- ~3x more
+# candidates, not an exploded search space.
+_WRIST_SWEEP_DEG = tuple(range(0, 181, 5))  # degrees; 180 deg-periodic for a parallel gripper
 
 
 @dataclass

@@ -184,24 +184,52 @@ not guessed:
    height from bug 5 -- once that was fixed, the same clearance constant needed retuning
    against the real, lower height.
 
-## Known limitations (stated plainly, not hidden)
+## Finger-height-aware scoring
 
-- **Full physical grasp success on the fork/knife is still not reliable**, even after all six
-  fixes above closed roughly a 4-14cm position error down to about 1cm. The reasoning pipeline
-  itself is real, tested, and correct at every stage (geometry -> candidates -> scoring ->
-  IK/collision filtering -> execution -> verification -> retry across many distinct
-  candidates without repeating one, confirmed by
-  `test_grasp_retries_multiple_distinct_candidates_without_repeating`) -- what remains
-  unreliable is the last centimeter of physical precision on an object only 1cm across. The
-  latest diagnosis: the wrist angle that achieves good *horizontal* finger-perpendicular
-  alignment (measured by projecting the closing axis onto the table plane) also tilts the
-  gripper noticeably off-level in the vertical axis -- the two fingers end up several
-  centimeters apart in height when closing on a 4mm-thick object, which the current alignment
-  metric doesn't penalize because it only checks the horizontal projection. The cup and plate
-  grasp reliably throughout all of this (never broke, verified after every change above).
-  Fastest next step: extend the alignment score to also penalize finger-height mismatch, so
-  candidate selection stops picking orientations that are horizontally great but vertically
-  tilted.
+The previous iteration's "fastest next step" (penalize finger-height mismatch in scoring) was
+implemented and gave real, measured improvement, but did not close the loop:
+
+- `geometry.py::ObjectGeometry.thickness` -- the object's shortest half-extent (for a box, the
+  flat dimension; for a cylinder, falls back to radius since no elongated cylinder exists in
+  the current object set to calibrate against).
+- `scoring.py` -- `evaluate_candidate` now measures `finger_left_z`/`finger_right_z` directly
+  from the same solved-angle forward kinematics every other metric already uses, and scores
+  `finger_height_mismatch` with the same clipped-linear shape already used for
+  `config_distance_score`/`workspace_margin` (no new scoring idiom introduced), tolerance
+  scaled to `2*thickness + 5mm` so a thin object is judged strictly and a thick one leniently.
+  `GraspWeights.finger_height_symmetry` (default 2.0, same order as `orientation_alignment`)
+  makes the trade-off configurable.
+- `candidates.py` -- the wrist sweep went from 15-degree to 5-degree steps. This was tested
+  as unnecessary at first (a 15-degree sample, `wrist=105deg`, appeared to have both good
+  alignment and near-zero mismatch) -- then found to be a measurement artifact: that
+  "candidate" was actually a badly non-converged solve sitting nowhere near the target (0.14m
+  position error, 1.5 rad orientation error); its "good" mismatch was meaningless because the
+  whole pose was wrong. Checking `ik_ok` before trusting any derived metric is what caught
+  this. The finer sweep was then genuinely necessary to find real, converged options near the
+  good-alignment region.
+
+**Measured result:** at 5-degree resolution, checked across a height sweep (1.5cm-6cm
+clearance) and against *both* arms, no candidate exists for the fork's current position that
+is simultaneously well-aligned (closing axis near-perpendicular to the fork) and vertically
+level (fingers within a few mm of each other in height) -- the practical floor for
+well-aligned candidates is a consistent ~9mm finger-height mismatch, regardless of grasp
+height or which arm reaches for it. That's larger than the fork's entire 8mm thickness.
+Scoring correctly identifies and selects the best genuinely-available trade-off (`wrist=90deg`,
+alignment 0.91, mismatch 9.3mm, score 0.734 -- versus 0.846 before this fix, appropriately
+lower since the mismatch is now honestly penalized) but that trade-off still isn't good enough
+to grasp an object this thin.
+
+**Root cause, confirmed by direct measurement** (not inferred): at the selected candidate,
+before closing, `left_finger` sits at z=20.8mm and `right_finger` at z=61.1mm, while the fork's
+surface spans roughly z=[-1.9mm, 6.1mm]. Only the left finger is anywhere near the object.
+After closing, contact logs confirm exactly that: 2 contacts recorded between the left finger
+and the fork, 0 between the right finger and the fork, for the entire hold+lift sequence -- the
+fork is grazed by one finger and never captured. This is failure mode **A: fingers never
+contact both sides** (see the debugging checklist this iteration worked through), not a slip,
+not an orientation surprise, not a friction/force issue -- a fixed ~5.5cm gap between the two
+fingers' heights that no amount of retry or re-scoring within the current candidate space
+closes. The cup and plate grasp reliably throughout all of this (verified after every change,
+including the finer wrist sweep and both scoring changes).
 - **Speechmatics integration is unverified.** Implemented from documented protocol knowledge,
   not tested against a live key. Confirm the auth flow (bearer key vs. short-lived JWT
   exchange) and endpoint region before the actual demo.

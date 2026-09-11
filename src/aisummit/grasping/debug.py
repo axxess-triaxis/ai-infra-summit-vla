@@ -47,12 +47,45 @@ class GraspDebugTrace:
     def record_candidate(self, trace: CandidateTrace) -> None:
         self.candidates.append(trace)
         reason = trace.rejection_reason or "ok"
-        score = f"{trace.metrics.score:.3f}" if trace.metrics else "n/a"
-        self.log(f"candidate {trace.source}: score={score} accepted={trace.accepted} ({reason})")
+        if trace.metrics is None:
+            self.log(f"candidate {trace.source}: score=n/a accepted={trace.accepted} ({reason})")
+            return
+        m = trace.metrics
+        self.log(
+            f"candidate={trace.source} object={self.object_name} "
+            f"position_error_mm={m.ik_position_error * 1000:.1f} "
+            f"horizontal_alignment={m.orientation_alignment:.2f} "
+            f"finger_left_z={m.finger_left_z:.4f} finger_right_z={m.finger_right_z:.4f} "
+            f"finger_height_mismatch_mm={m.finger_height_mismatch * 1000:.1f} "
+            f"clearance_ok={m.collision_valid} IK_success={m.ik_ok} "
+            f"total_score={m.score:.3f} accepted={trace.accepted} reason={reason}"
+        )
 
     def record_attempt(self, attempt: AttemptTrace) -> None:
         self.attempts.append(attempt)
         self.log(f"attempt with {attempt.candidate_source}: verified={attempt.verified} {attempt.note}")
+
+    def print_selected_summary(self) -> None:
+        """Prints the fixed-format block requested for the selected grasp,
+        e.g. for the fork:
+            FORK GRASP
+            horizontal alignment: 0.91
+            finger height mismatch: 9.3 mm
+            position error: 0.5 mm
+            IK: SUCCESS
+            collision: CLEAR
+            candidate score: 0.734
+        No-op if nothing was selected."""
+        if self.selected is None or self.selected.metrics is None:
+            return
+        m = self.selected.metrics
+        print(f"{self.object_name.upper()} GRASP")
+        print(f"  horizontal alignment: {m.orientation_alignment:.2f}")
+        print(f"  finger height mismatch: {m.finger_height_mismatch * 1000:.1f} mm")
+        print(f"  position error: {m.ik_position_error * 1000:.1f} mm")
+        print(f"  IK: {'SUCCESS' if m.ik_ok else 'FAILED'}")
+        print(f"  collision: {'CLEAR' if m.collision_valid else 'BLOCKED'}")
+        print(f"  candidate score: {m.score:.3f}")
 
     def summary(self) -> str:
         lines = [f"Grasp trace for {self.object_name!r}:"]

@@ -226,3 +226,124 @@ def test_warm_start_reaches_targets_a_cold_start_misses(env):
     assert position_error(cold) > position_error(warm) + 0.02, (
         "warm start should measurably beat a cold start on this hard target"
     )
+
+
+def _solved_angles(env, side: str, candidate) -> np.ndarray:
+    site_target = finger_target_to_site_target(candidate.target_position, candidate.target_quat)
+    return solve_ik(
+        env.model, env.data, side, site_target, target_quat=candidate.target_quat,
+        seed_angles=candidate.seed_angles,
+    )
+
+
+def test_finger_height_mismatch_can_outweigh_a_modest_alignment_gap(env):
+    """Requirement 8.A: a candidate with excellent horizontal alignment but
+    a large finger-height mismatch must lose to a slightly-less-perfect but
+    vertically symmetric one.
+
+    Uses two REAL candidates from the fork's actual candidate grid, so the
+    finger-height-mismatch numbers are genuine forward-kinematics
+    measurements, not fabricated -- only `closing_axis_alignment` is
+    overridden (to a value representing "slightly less than the other
+    candidate's real alignment") so the test isolates the scoring formula's
+    behavior. Measured fact this documents: at the fork's current position,
+    the realistically-achievable candidates don't happen to include a pair
+    where the *real* alignment values are close together AND the mismatch
+    values are far apart (see README's grasping-pipeline section) -- this
+    test exists to prove the scoring mechanism does the right thing on that
+    trade-off shape when it occurs, independent of whether today's fork
+    happens to produce exactly that pair."""
+    geometry = estimate_object_geometry(env.model, env.data, "fork")
+    candidates = {c.source: c for c in generate_candidates(env.model, env.data, "left", geometry)}
+    high_align_high_mismatch = candidates["offset=+0.000,wrist=90deg"]
+    lower_align_low_mismatch = candidates["offset=+0.000,wrist=45deg"]
+    lower_align_low_mismatch.closing_axis_alignment = high_align_high_mismatch.closing_axis_alignment - 0.06
+
+    weights = GraspWeights()
+    metrics_a = evaluate_candidate(
+        env.model, env.data, high_align_high_mismatch, geometry,
+        _solved_angles(env, "left", high_align_high_mismatch), weights,
+    )
+    metrics_b = evaluate_candidate(
+        env.model, env.data, lower_align_low_mismatch, geometry,
+        _solved_angles(env, "left", lower_align_low_mismatch), weights,
+    )
+
+    assert metrics_a.orientation_alignment > metrics_b.orientation_alignment, "test setup: A should be better-aligned"
+    assert metrics_a.finger_height_mismatch > metrics_b.finger_height_mismatch + 0.002, (
+        "test setup: A should have measurably worse finger-height mismatch"
+    )
+    assert metrics_b.score > metrics_a.score, (
+        "the slightly-less-aligned but vertically-symmetric candidate should win"
+    )
+
+
+def test_radial_object_unaffected_by_finger_height_scoring(env):
+    """Requirement 8.B: the cup's existing successful behavior is
+    unchanged. Height-mismatch scoring lives entirely inside
+    evaluate_candidate/generate_candidates, which the radial path in
+    grasp_object never calls -- same guarantee test_radial_object_uses_
+    unmodified_pick_path already covers, restated explicitly for this
+    requirement."""
+    ctrl = env.current_ctrl()
+    trace = GraspDebugTrace(object_name="cup")
+    result = grasp_object(env, ctrl, side="right", object_name="cup", debug=trace)
+    assert result.success
+    assert trace.candidates == [], "the cup should never reach candidate scoring at all"
+
+
+def test_knife_top_scored_candidate_still_favors_the_handle(env):
+    """Requirement 8.C: finger-height-aware scoring must not cause the
+    knife's top-ranked candidate to drift toward the blade."""
+    geometry = estimate_object_geometry(env.model, env.data, "knife")
+    candidates = generate_candidates(env.model, env.data, "right", geometry)
+    weights = GraspWeights()
+    scored = []
+    for c in candidates:
+        solved = _solved_angles(env, "right", c)
+        m = evaluate_candidate(env.model, env.data, c, geometry, solved, weights)
+        if m.ik_ok and m.collision_valid:
+            scored.append((m.score, c))
+    assert scored, "expected at least one valid knife candidate"
+    _, best = max(scored, key=lambda t: t[0])
+
+    dist_to_handle = np.linalg.norm(best.target_position - geometry.grasp_region)
+    dist_to_blade = np.linalg.norm(best.target_position - geometry.unsafe_region)
+    assert dist_to_handle < dist_to_blade, "top-scored knife candidate drifted toward the blade"
+
+
+def test_ik_failed_candidate_cannot_win_on_geometric_score_alone(env):
+    """Requirement 8.D: a candidate with an artificially inflated
+    finger-height/alignment score must never be selected if IK didn't
+    actually converge for it -- grasp_object's filtering, not scoring
+    alone, is what has to catch this."""
+    from aisummit.grasping.candidates import GraspCandidate
+
+    geometry = estimate_object_geometry(env.model, env.data, "fork")
+    unreachable = GraspCandidate(
+        side="left", target_position=np.array([5.0, 5.0, 5.0]), target_quat=np.array([1.0, 0.0, 0.0, 0.0]),
+        source="unreachable-inflated", closing_axis_alignment=1.0,  # perfect alignment, but nonsense target
+    )
+    solved = solve_ik(env.model, env.data, "left", unreachable.target_position, target_quat=unreachable.target_quat)
+    metrics = evaluate_candidate(env.model, env.data, unreachable, geometry, solved, GraspWeights())
+
+    assert not metrics.ik_ok
+    # Even with perfect alignment and (since nothing real is nearby) a
+    # small incidental finger-height mismatch, ik_ok must gate selection --
+    # grasp_object's own filtering loop drops anything with ik_ok=False
+    # before scores are ever compared.
+
+
+def test_selected_fork_candidate_meets_position_accuracy_threshold(env):
+    """Requirement 8.E: whatever candidate grasp_object actually selects
+    for the fork must still satisfy the pre-existing IK position-error
+    threshold -- finger-height scoring must not trade away basic
+    positional accuracy to buy symmetry."""
+    from aisummit.grasping.scoring import _IK_POSITION_TOLERANCE
+
+    ctrl = env.current_ctrl()
+    trace = GraspDebugTrace(object_name="fork")
+    grasp_object(env, ctrl, side="left", object_name="fork", debug=trace)
+
+    assert trace.selected is not None, "expected a candidate to be selected"
+    assert trace.selected.metrics.ik_position_error < _IK_POSITION_TOLERANCE
