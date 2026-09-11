@@ -19,7 +19,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from PIL import Image
 
-from aisummit.control.primitives import pick, place
+from aisummit.control.primitives import place, place_oriented
+from aisummit.grasping.debug import GraspDebugTrace, draw_grasp_overlay
+from aisummit.grasping.planner import grasp_object
 from aisummit.planner.vla_planner import PlanStep, plan_from_instruction
 from aisummit.sim.env import DinnerTableEnv
 from aisummit.voice.speechmatics_client import stream_transcripts
@@ -27,20 +29,47 @@ from aisummit.voice.speechmatics_client import stream_transcripts
 OUTPUT_DIR = Path("outputs")
 
 
-def execute_plan(env: DinnerTableEnv, steps: list[PlanStep]):
+def execute_plan(env: DinnerTableEnv, steps: list[PlanStep], debug: bool = False):
+    """Routes "pick" through the orientation-aware grasp pipeline
+    (grasping/planner.py) -- which itself falls back to the original
+    position-only pick() unchanged for radially symmetric objects -- and
+    remembers each arm's achieved grasp orientation so the matching
+    "place" keeps the object at a predictable orientation through
+    transport (important for a knife) instead of reverting to a
+    default top-down placement."""
     ctrl = env.current_ctrl()
     obs = None
+    held_quat: dict[str, object] = {}
     for step in steps:
         if step.action == "pick":
             print(f"  {step.arm} arm: pick {step.object}")
-            ctrl, obs = pick(env, ctrl, side=step.arm, object_name=step.object)
+            pre_grasp_frame = env.render()
+            trace = GraspDebugTrace(object_name=step.object, verbose=debug)
+            result = grasp_object(env, ctrl, side=step.arm, object_name=step.object, debug=trace)
+            ctrl, obs = result.final_ctrl, obs
+            held_quat[step.arm] = result.achieved_quat
+            print(f"    grasp {'succeeded' if result.success else 'FAILED'}"
+                  f" ({len(trace.attempts)} attempt(s) tried)")
+            if debug:
+                print(trace.summary())
+            if trace.geometry is not None and trace.geometry.is_elongated:
+                overlay = draw_grasp_overlay(
+                    pre_grasp_frame, env.model, env.data, "overhead_cam", trace.geometry,
+                    selected_position=trace.geometry.grasp_region,
+                )
+                Image.fromarray(overlay).save(OUTPUT_DIR / f"grasp_debug_{step.object}.png")
+                print(f"    saved grasp overlay to {OUTPUT_DIR / f'grasp_debug_{step.object}.png'}")
         elif step.action == "place":
             print(f"  {step.arm} arm: place at {step.target_xyz}")
-            ctrl, obs = place(env, ctrl, side=step.arm, target_xyz=step.target_xyz)
+            quat = held_quat.get(step.arm)
+            if quat is not None:
+                ctrl, obs = place_oriented(env, ctrl, side=step.arm, target_xyz=step.target_xyz, target_quat=quat)
+            else:
+                ctrl, obs = place(env, ctrl, side=step.arm, target_xyz=step.target_xyz)
     return obs
 
 
-def run(instruction: str):
+def run(instruction: str, debug: bool = False):
     OUTPUT_DIR.mkdir(exist_ok=True)
     env = DinnerTableEnv()
     try:
@@ -54,7 +83,7 @@ def run(instruction: str):
             print("Planner returned no steps (ambiguous instruction, or nothing to do).")
             return
         print(f"Plan ({len(steps)} steps):")
-        execute_plan(env, steps)
+        execute_plan(env, steps, debug=debug)
 
         after = env.render()
         Image.fromarray(after).save(OUTPUT_DIR / "after.png")

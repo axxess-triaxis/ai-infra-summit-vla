@@ -1,8 +1,18 @@
 """Damped least-squares numerical IK for one ALOHA arm.
 
-Solves position-only IK (no orientation term) against the `{side}/gripper`
-site's 6 arm joints. Runs on a scratch copy of MjData so it never disturbs
-the live simulation while it iterates.
+Solves against the `{side}/gripper` site's 6 arm joints. Runs on a scratch
+copy of MjData so it never disturbs the live simulation while it iterates.
+
+`target_quat` is optional and additive: omit it (the default) and this is
+the exact same position-only 3-constraint solve it always was -- every
+existing caller (`control/primitives.py::move_to`) is unaffected. Pass it
+and the solve becomes a fully-determined 6-constraint (3 position + 3
+orientation) problem, which is what `grasping/` uses for elongated objects.
+This was extended rather than replaced per the hackathon brief's "don't
+rewrite the IK unless necessary" -- the Jacobian call already computed
+underneath (`mj_jacSite`) exposes the rotational Jacobian for free via its
+second output argument, which the position-only path simply passed `None`
+for.
 """
 
 from __future__ import annotations
@@ -34,14 +44,26 @@ def _joint_ranges(model: mujoco.MjModel, side: str) -> np.ndarray:
     return np.array(ranges)
 
 
+def _orientation_error(scratch: mujoco.MjData, site_id: int, target_quat: np.ndarray) -> np.ndarray:
+    """3-vector tangent-space rotation from the site's current orientation to `target_quat`."""
+    cur_quat = np.zeros(4)
+    mujoco.mju_mat2Quat(cur_quat, scratch.site(site_id).xmat)
+    err = np.zeros(3)
+    mujoco.mju_subQuat(err, np.asarray(target_quat), cur_quat)
+    return err
+
+
 def solve_ik(
     model: mujoco.MjModel,
     data: mujoco.MjData,
     side: str,
     target_xyz: np.ndarray,
+    target_quat: np.ndarray | None = None,
+    max_iters: int = _MAX_ITERS,
 ) -> np.ndarray:
     """Returns the 6 target joint angles for `side`'s arm that bring its
-    gripper site closest to `target_xyz`. Does not mutate `data`."""
+    gripper site closest to `target_xyz` (and, if given, `target_quat`, a
+    world-frame quaternion in wxyz order). Does not mutate `data`."""
     scratch = mujoco.MjData(model)
     scratch.qpos[:] = data.qpos
     scratch.qvel[:] = data.qvel
@@ -54,14 +76,22 @@ def solve_ik(
     joint_ranges = _joint_ranges(model, side)
 
     jacp = np.zeros((3, model.nv))
-    for _ in range(_MAX_ITERS):
-        site_pos = scratch.site(site_id).xpos
-        err = np.asarray(target_xyz) - site_pos
+    jacr = np.zeros((3, model.nv)) if target_quat is not None else None
+    ndim = 6 if target_quat is not None else 3
+    damping_eye = (_DAMPING**2) * np.eye(ndim)
+
+    for _ in range(max_iters):
+        pos_err = np.asarray(target_xyz) - scratch.site(site_id).xpos
+        if target_quat is None:
+            err = pos_err
+        else:
+            err = np.concatenate([pos_err, _orientation_error(scratch, site_id, target_quat)])
         if np.linalg.norm(err) < _TOLERANCE:
             break
-        mujoco.mj_jacSite(model, scratch, jacp, None, site_id)
-        J = jacp[:, dof_idx]  # (3, 6)
-        JJt = J @ J.T + (_DAMPING**2) * np.eye(3)
+
+        mujoco.mj_jacSite(model, scratch, jacp, jacr, site_id)
+        J = jacp[:, dof_idx] if target_quat is None else np.vstack([jacp[:, dof_idx], jacr[:, dof_idx]])
+        JJt = J @ J.T + damping_eye
         dq = J.T @ np.linalg.solve(JJt, err)
         for k, qi in enumerate(qpos_idx):
             new_val = scratch.qpos[qi] + _STEP_SIZE * dq[k]
@@ -69,3 +99,11 @@ def solve_ik(
         mujoco.mj_forward(model, scratch)
 
     return np.array([scratch.qpos[qi] for qi in qpos_idx])
+
+
+def site_pose(model: mujoco.MjModel, data: mujoco.MjData, site_name: str) -> tuple[np.ndarray, np.ndarray]:
+    """(world position, world quaternion wxyz) of a named site, read via forward kinematics."""
+    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(quat, data.site(site_id).xmat)
+    return data.site(site_id).xpos.copy(), quat

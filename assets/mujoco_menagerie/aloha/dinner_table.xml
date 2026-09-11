@@ -21,11 +21,20 @@
     <body name="fork" pos="-0.22 0.05 0.02">
       <freejoint name="fork_free"/>
       <geom name="fork_geom" type="box" size="0.01 0.09 0.004" material="fork_mat" mass="0.03"/>
+      <!-- Handle occupies the -y third of the shaft; tines are the +y end.
+           A stand-in for what a real perception stack would locate via
+           segmentation-mask PCA -- see grasping/geometry.py docstring. -->
+      <site name="fork/handle" pos="0 -0.05 0" group="6" rgba="0 1 0 0.5" size="0.006"/>
     </body>
 
     <body name="knife" pos="0.22 0.05 0.02">
       <freejoint name="knife_free"/>
       <geom name="knife_geom" type="box" size="0.008 0.10 0.004" material="knife_mat" mass="0.03"/>
+      <!-- Handle at the -y end; blade (unsafe-to-grasp) spans the +y end,
+           deliberately given a larger handle-to-end offset than the fork's
+           so the two aren't geometrically identical. -->
+      <site name="knife/handle" pos="0 -0.06 0" group="6" rgba="0 1 0 0.5" size="0.006"/>
+      <site name="knife/unsafe" pos="0 0.05 0" group="6" rgba="1 0 0 0.5" size="0.006"/>
     </body>
 
     <body name="cup" pos="0.30 0.20 0.03">

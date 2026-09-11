@@ -102,13 +102,70 @@ Given a one-week window, we dropped robosuite and built directly on the official
 bindings plus DeepMind's own ALOHA model from `mujoco_menagerie` -- verified working
 end-to-end on this machine (model loads, renders, and the pick-and-place test passes).
 
+## Orientation-aware grasping (`grasping/`)
+
+The IK-is-position-only limitation above was real and has been substantially addressed --
+`control/ik.py`'s `solve_ik` now takes an optional `target_quat` (omit it and it's the exact
+same position-only solve it always was; every existing caller is unaffected), and a new
+`grasping/` package sits above it doing real geometric reasoning instead of "find XYZ and
+grab":
+
+```
+estimate_object_geometry()  ->  generate_candidates()  ->  evaluate_candidate() (scored,
+   (geometry.py, reads         (candidates.py, sweeps       ranked, collision- and
+   MuJoCo's own body/geom       the arm's own wrist_rotate   IK-filtered; scoring.py)
+   pose -- see its docstring    joint, measures the real
+   for the perception           finger-to-finger line via
+   scoping trade-off)           forward kinematics)
+                                        |
+                                        v
+                          grasp_object() executes the best-scoring
+                          candidate, verifies the lift physically,
+                          and retries the next-best candidate (never
+                          repeating one) on failure  (planner.py)
+```
+
+- Radially symmetric objects (cup, plate) take the **exact original `pick()` path**,
+  unchanged -- `grasp_object` checks `geometry.is_elongated` first and only runs the new
+  machinery for the fork/knife case. `tests/test_grasping.py::test_radial_object_uses_unmodified_pick_path`
+  asserts the candidate generator never even runs for the cup.
+- `assets/mujoco_menagerie/aloha/dinner_table.xml` now authors a `{object}/handle` site (and
+  a `{object}/unsafe` blade-region site for the knife) on the fork and knife bodies --
+  ground-truth grasp-region geometry standing in for a real segmentation+PCA stage.
+- `grasping/collision.py` poses a candidate's solved joint angles on a scratch `MjData` (no
+  dynamics stepped) and checks MuJoCo's own contact detection against both other tableware
+  objects and the table/floor.
+- `grasping/debug.py` gives a structured trace of every candidate (accepted/rejected and
+  why) plus `draw_grasp_overlay()`, which projects the object's principal axis, handle,
+  unsafe region, and selected grasp point onto the overhead camera image using MuJoCo's own
+  camera intrinsics -- verified working (see the trace/overlay evidence in the implementation
+  writeup).
+- `grasping/scoring.py::GraspWeights` holds every scoring weight as one configurable
+  dataclass rather than literals scattered through the code.
+- `grasping/planner.py::stabilize_with_other_arm` is a real, tested, opt-in bimanual
+  capability (the other arm lightly touches the object's far end while the grasp arm works)
+  -- not force-enabled, since the current object set's widths don't naturally cross the
+  low-stability trigger.
+
+**Two real bugs were found and fixed during this work** (both documented with root cause in
+the implementation writeup, not just patched silently): `collision.py` originally never
+checked collisions against the table/floor itself, only other tableware; and the original
+two-waypoint "approach then descend" pattern (copied from `pick()`) measurably *hurt* IK
+convergence for twisted, non-top-down orientations (a kinematic elbow-flip effect) --
+`pick_oriented`/`place_oriented` now move directly to the grasp pose in one stage.
+
 ## Known limitations (stated plainly, not hidden)
 
-- **IK is position-only.** The fork and knife are thin, elongated boxes; grasping them
-  reliably needs the gripper's approach orientation aligned to the object's long axis, which
-  our IK doesn't control. The cup and plate (radially symmetric) grasp reliably from any
-  approach angle -- confirmed by test. Fixing this means extending `ik.py` to a full 6-DOF
-  position+orientation damped least-squares solve.
+- **Full physical grasp success on the fork/knife is not yet reliable.** The reasoning
+  pipeline above is real, tested, and correctly executes every stage (geometry -> candidates
+  -> scoring -> IK/collision filtering -> execution -> verification -> retry across multiple
+  distinct candidates, confirmed by `test_grasp_retries_multiple_distinct_candidates_without_repeating`),
+  but for this arm's specific kinematics and the fork's current table position, the window of
+  wrist orientations that are simultaneously (a) well-aligned for a perpendicular grip and (b)
+  clear of the table turned out to be very narrow (a few degrees), and the position-actuator
+  PD gains settle slowly into strongly twisted poses. The cup and plate grasp reliably. See
+  "Fastest additional improvements" in the implementation writeup for the concrete next steps
+  (finer/adaptive wrist search, or a side-approach rather than top-down for thin flat objects).
 - **Speechmatics integration is unverified.** Implemented from documented protocol knowledge,
   not tested against a live key. Confirm the auth flow (bearer key vs. short-lived JWT
   exchange) and endpoint region before the actual demo.
