@@ -123,13 +123,13 @@ class GraspCandidate:
     seed_angles: np.ndarray | None = None  # warm-start for the final 6-DOF solve -- see solve_ik's docstring
 
 
-def _finger_positions(model: mujoco.MjModel, data: mujoco.MjData, side: str) -> tuple[np.ndarray, np.ndarray]:
+def finger_positions(model: mujoco.MjModel, data: mujoco.MjData, side: str) -> tuple[np.ndarray, np.ndarray]:
     left_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{side}/left_finger")
     right_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{side}/right_finger")
     return data.site(left_id).xpos.copy(), data.site(right_id).xpos.copy()
 
 
-def _seed_scratch(model: mujoco.MjModel, data: mujoco.MjData, side: str, arm_angles: np.ndarray) -> mujoco.MjData:
+def seed_scratch(model: mujoco.MjModel, data: mujoco.MjData, side: str, arm_angles: np.ndarray) -> mujoco.MjData:
     scratch = mujoco.MjData(model)
     scratch.qpos[:] = data.qpos
     for j, joint_name in enumerate(ARM_JOINTS):
@@ -138,7 +138,7 @@ def _seed_scratch(model: mujoco.MjModel, data: mujoco.MjData, side: str, arm_ang
     return scratch
 
 
-def _horizontal_unit(vec: np.ndarray) -> np.ndarray:
+def horizontal_unit(vec: np.ndarray) -> np.ndarray:
     flat = vec.copy()
     flat[2] = 0.0
     norm = np.linalg.norm(flat)
@@ -156,7 +156,7 @@ def generate_candidates(
 ) -> list[GraspCandidate]:
     real_close_point = geometry.grasp_region if geometry.grasp_region is not None else geometry.position
     base_point = real_close_point + np.array([0, 0, _GRASP_HEIGHT_CLEARANCE])
-    axis_h = _horizontal_unit(geometry.principal_axis)
+    axis_h = horizontal_unit(geometry.principal_axis)
     trans_h = transverse_axis_h(geometry)
     wrist_jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{side}/wrist_rotate")
     wrist_qadr = model.jnt_qposadr[wrist_jnt_id]
@@ -174,7 +174,7 @@ def generate_candidates(
         seed_angles = solve_ik(model, data, side, target_pos)  # unmodified position-only IK, reused as-is
 
         for wrist_deg in wrist_sweep_deg:
-            scratch = _seed_scratch(model, data, side, seed_angles)
+            scratch = seed_scratch(model, data, side, seed_angles)
             scratch.qpos[wrist_qadr] = np.radians(wrist_deg)
             mujoco.mj_forward(model, scratch)
 
@@ -182,8 +182,8 @@ def generate_candidates(
             quat = np.zeros(4)
             mujoco.mju_mat2Quat(quat, scratch.site(gripper_site_id).xmat)
 
-            left_finger, right_finger = _finger_positions(model, scratch, side)
-            closing_axis = _horizontal_unit(right_finger - left_finger)
+            left_finger, right_finger = finger_positions(model, scratch, side)
+            closing_axis = horizontal_unit(right_finger - left_finger)
             alignment = 1.0 - abs(float(np.dot(closing_axis, axis_h)))
 
             wrist_overridden_angles = np.array(

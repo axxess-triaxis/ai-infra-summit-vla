@@ -311,7 +311,7 @@ failure entirely. Every rejection reason for both fork and knife, on both arms, 
 progress: the pipeline no longer confuses "too high to reach" with "genuinely can't grasp this,"
 and the diagnostic is now precise about which of the two is actually happening. What it did not
 do is produce a feasible grasp -- the pre-existing collision-vs-alignment conflict (well-aligned
-wrist angles put the gripper body into the table) was never about height offset, and remains:
+wrist angles push part of the arm into the table) was never about height offset, and remains:
 
 ```
 fork  / left:  185 evaluated, 75 IK-converged, 0 feasible -- best: align=0.80, mismatch=9.2mm, penetration=-21.2mm
@@ -337,15 +337,87 @@ requirement (now uniformly false for every converged knife candidate, a separate
 what that test checks) in favor of `ik_ok` alone, plus an added `env.settle()` call it had been
 missing.
 
-**Remaining highest-value intervention**: the collision-vs-alignment conflict itself. The
-gripper BODY (not the fingers) penetrates the table at well-aligned wrist angles regardless of
-close height -- worth checking whether a different wrist axis convention, or accepting a lower
-alignment target with a wider tolerance, or a fundamentally different approach vector (e.g.
-sweeping the elbow/shoulder configuration, not just wrist_rotate and horizontal position) could
-find a configuration this pipeline hasn't sampled yet.
+**Correction (root cause, verified by direct inspection):** every write-up through this point
+described the colliding body as "the gripper body" (implying `gripper_base`, the mounting
+bracket behind the fingers). That was wrong. Reading `scratch.contact[i]` and mapping
+`geom_bodyid` back to body names for the actual best-infeasible candidates -- both the standard
+wrist=85deg one and the wrist_angle-varied ones tried afterward -- shows the colliding bodies are
+`{side}/left_finger_link` and `{side}/right_finger_link` themselves, not `gripper_base`. This
+isn't a mounting-clearance problem; it's that the finger assembly's own physical geometry --
+which necessarily must be at the object's height to grasp it -- doesn't fit above the table at
+any orientation that closes meaningfully across the fork's width, at this reach position.
 
-- **Speechmatics integration is unverified.** Implemented from documented protocol knowledge,
-  not tested against a live key. Confirm the auth flow (bearer key vs. short-lived JWT
-  exchange) and endpoint region before the actual demo.
+**Remaining highest-value intervention**: the collision-vs-alignment conflict itself.
+
+## Alternative contact strategies
+
+Rather than continuing to search within the conventional bilateral (symmetric, closing-across-
+the-width) grasp, this iteration asks a different question: can the fork be acquired through a
+fundamentally different contact strategy? Two were investigated.
+
+`grasping/contact_strategies.py` defines four named strategies as data
+(`CONVENTIONAL_BILATERAL_GRASP`, `HANDLE_END_ACQUISITION`, `CONSTRAINED_SIDE_APPROACH`,
+`SCOOPING_BACKSTOP_APPROACH`) -- a lookup table, not a class hierarchy, since only two are
+investigated and a Protocol/ABC framework for two implementations would be premature. New
+`planner.py::acquire_object` is the "normal grasp is infeasible -> try another contact
+strategy" entrypoint: tries the conventional path first, and only escalates on failure.
+
+**Handle-end acquisition** (implemented and tested): targets the handle's physical end, and --
+critically -- searches `wrist_angle` jointly with `wrist_rotate` (a bounded 5x13 grid, not the
+conventional strategy's wrist_rotate-only sweep), a genuinely different orientation-search
+family, not just a relabeled target point. Result: infeasible. Of 65 candidates, 23 converge,
+zero are collision-free -- the best converged, well-aligned candidate still penetrates the
+table by 2.7cm, the same magnitude found everywhere else. Targeting the literal 1cm-from-tip
+point (rather than the handle's center, previously the closest tested) makes no difference
+either: identical ~2.3-2.5cm penetration, confirming the constraint isn't about *where* along
+the fork's length the target sits.
+
+**Scooping/backstop approach** (investigated, not implemented as a motion sequence -- rejected
+before building one, backed by a real physical test, not just reasoning): the plate is the only
+candidate backstop, and sits 11cm from the fork along the one useful push axis, with its top
+surface only ~6mm above the table -- neither fact changes the actual constraint. More directly:
+the one orientation already confirmed collision-free (`wrist_angle=wrist_rotate=0`, a level
+approach) was tested for real -- open, approach, close, lift. The fork's position was identical
+before approach, after closing, and after lift, to 12 decimal places: the closing axis at that
+orientation is parallel to the fork's length, so the gripper closes in the object's own
+longitudinal plane and never engages its cross-section. Separately, the ALOHA gripper's ~7.4cm
+max opening is smaller than the fork's 18cm length, so an end-to-end pinch spanning the whole
+object isn't geometrically possible at any orientation. `CONSTRAINED_SIDE_APPROACH` is named in
+the strategy vocabulary but not separately implemented -- it reduces to the same underlying
+constraint handle-end acquisition already tested (finger-link geometry vs. table clearance, not
+object-relative positioning).
+
+**Contact is not collision** (Phase 5 of the brief this implements): `collision.py` gained
+`classify_contacts()`, purely additive -- `check_collision` (every existing caller) is
+untouched. It labels every arm contact as `intended_target`, `intended_support` (a hook for a
+future backstop strategy, unused by anything yet), `table_penetration`, or
+`unintended_collision`, rather than a single pass/fail. `verify_retained_during_lift()` uses
+this for a stricter acquisition check than "did the object move": it requires an actual
+finger-object contact at the moment of checking, catching a nudged-but-not-held object that a
+position/tracking check alone would misreport as acquired.
+
+**Conclusion, stated at the scope this iteration actually tested**: no tested conventional
+bilateral grasp, and no tested handle-end acquisition, at this fork pose satisfies the required
+kinematic, contact, and table-clearance constraints. Scooping/backstop was evaluated and rejected
+by direct physical test, not assumed impossible. This is not a claim that grasping the fork is
+impossible in general -- repositioning the object, or a differently-shaped end effector, are
+untested and likely-different problems.
+
+Tests: 27/27 passing (20 previous + 7 new, requirements A-G).
+
+## Speechmatics -- now verified live
+
+Previously flagged as entirely unverified. Tested against a real account and API key: the
+WebSocket connects to `wss://eu2.rt.speechmatics.com/v2`, the `Authorization: Bearer <key>`
+header (no JWT exchange) is accepted, and the full message sequence
+(`StartRecognition` -> `RecognitionStarted` -> `AudioAdded` -> `AddTranscript` ->
+`EndOfStream`/`EndOfTranscript`) matches `voice/speechmatics_client.py`'s implementation exactly
+-- confirmed by running the production client against both a raw protocol test and the real
+`stream_transcripts()` function with a synthesized WAV file, no exceptions, clean completion.
+Free tier: $100 credit, no card required, 2 concurrent real-time sessions -- sufficient for a
+demo. Not yet tested with real spoken words (only synthesized tones, to isolate protocol
+correctness from transcription content) -- that's the one remaining check before the actual demo
+recording.
+
 - **Object set is four primitives**, not photorealistic tableware meshes -- fine for a
   reasoning/manipulation demo, not for a visual polish pass.

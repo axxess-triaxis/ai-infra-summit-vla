@@ -520,3 +520,164 @@ def test_candidate_generation_is_deterministic_and_bounded(env):
     # small relative to what an unconstrained grid over the same ranges
     # would produce.
     assert len(first) == 185
+
+
+# --- Alternative contact strategies (grasping/contact_strategies.py) ---
+
+
+def test_conventional_grasp_infeasible_at_known_bad_fork_pose(env):
+    """Requirement A: the conventional strategy is correctly classified as
+    infeasible at the fork's current table position -- the premise the
+    rest of this section (and grasping/contact_strategies.py) is built
+    on. Not a new claim -- restates it explicitly under this iteration's
+    requirement letter, using the real orchestrator entrypoint."""
+    from aisummit.grasping.planner import acquire_object
+
+    ctrl = env.current_ctrl()
+    trace = GraspDebugTrace(object_name="fork")
+    result = acquire_object(env, ctrl, side="left", object_name="fork", debug=trace)
+
+    assert not result.success
+    assert trace.candidates, "expected the conventional search to have run and recorded candidates"
+    assert not any(c.accepted for c in trace.candidates), "no conventional candidate should be feasible"
+
+
+def test_alternative_strategy_is_tried_when_conventional_is_infeasible(env, monkeypatch):
+    """Requirement B: acquire_object actually invokes the alternative
+    strategy when the conventional one is infeasible, and adopts its
+    result when it succeeds. The real handle-end search is infeasible for
+    today's fork (a genuine finding, not a gap -- see README), so this
+    forces a successful StrategyOutcome to test the ORCHESTRATION logic
+    itself: does `acquire_object` correctly execute and adopt an
+    alternative strategy's result, independent of whether real physics
+    happens to make one available today."""
+    import aisummit.grasping.planner as planner_module
+    from aisummit.grasping.candidates import generate_candidates as real_generate_candidates
+    from aisummit.grasping.contact_strategies import HANDLE_END_ACQUISITION, StrategyOutcome
+    from aisummit.grasping.planner import _solve_matching_execution
+    from aisummit.grasping.scoring import evaluate_candidate as real_evaluate_candidate
+
+    geometry = estimate_object_geometry(env.model, env.data, "fork")
+    # A real candidate (real target/quat/seed), just declared feasible by
+    # fiat -- this is the SAME "force feasible" technique used elsewhere
+    # in this file, applied here to test orchestration, not scoring.
+    fake_feasible_candidate = real_generate_candidates(env.model, env.data, "left", geometry)[0]
+    solved = _solve_matching_execution(env, "left", fake_feasible_candidate)
+    fake_metrics = real_evaluate_candidate(env.model, env.data, fake_feasible_candidate, geometry, solved, GraspWeights())
+    fake_metrics.feasible = True
+
+    def fake_handle_end(env_, side, geometry_, weights=None):
+        return StrategyOutcome(
+            spec=HANDLE_END_ACQUISITION, feasible=True, candidates_evaluated=1, ik_converged=1,
+            best_candidate=fake_feasible_candidate, best_metrics=fake_metrics, reason="",
+        )
+
+    monkeypatch.setattr(planner_module, "grasp_object", lambda *a, **kw: _infeasible_conventional_result(env, "fork"))
+    import aisummit.grasping.contact_strategies as strategies_module
+    monkeypatch.setattr(strategies_module, "evaluate_handle_end_grasp", fake_handle_end)
+
+    from aisummit.grasping.planner import acquire_object
+
+    ctrl = env.current_ctrl()
+    result = acquire_object(env, ctrl, side="left", object_name="fork")
+    assert result.strategy == "handle_end_acquisition", "the alternative strategy should have been adopted"
+
+
+def _infeasible_conventional_result(env, object_name: str):
+    from aisummit.grasping.geometry import estimate_object_geometry as _geo
+    from aisummit.grasping.planner import GraspResult
+
+    trace = GraspDebugTrace(object_name=object_name)
+    trace.geometry = _geo(env.model, env.data, object_name)
+    return GraspResult(False, "left", object_name, trace, env.current_ctrl())
+
+
+def test_intended_contact_distinguishable_from_table_penetration(env):
+    """Requirement C: `classify_contacts` tells intended target-object
+    contact apart from real table penetration -- "contact is not
+    collision" (Phase 5). Uses the same known-bad candidate from the
+    conventional search (confirmed table-penetrating) to get a genuine
+    `table_penetration` classification, and a real, successful cup grasp
+    to get a genuine `intended_target` one -- both from real physics, not
+    constructed contact objects."""
+    from aisummit.grasping.collision import classify_contacts
+    from aisummit.grasping.contact_strategies import _current_side_arm_angles
+
+    # A known table-penetrating fork pose (from the real candidate search).
+    fork_geometry = estimate_object_geometry(env.model, env.data, "fork")
+    candidates = generate_candidates(env.model, env.data, "left", fork_geometry)
+    penetrating = next(c for c in candidates if c.source == "long=+0.000,trans=+0.000,wrist=90deg")
+    solved = _solved_angles(env, "left", penetrating)
+    contacts = classify_contacts(env.model, env.data, "left", solved, target_object="fork")
+    assert any(c.kind == "table_penetration" for c in contacts), "expected a genuine table penetration"
+    assert not any(c.kind == "intended_target" for c in contacts), "arm isn't near the fork in this pose"
+
+    # A real, successful cup grasp -- genuine finger-object contact.
+    from aisummit.control.primitives import pick
+
+    ctrl = env.current_ctrl()
+    pick(env, ctrl, side="right", object_name="cup")
+    cup_contacts = classify_contacts(
+        env.model, env.data, "right", _current_side_arm_angles(env, "right"), target_object="cup",
+    )
+    assert any(c.kind == "intended_target" for c in cup_contacts), "expected genuine finger-cup contact after a real grasp"
+
+
+def test_object_moving_without_contact_is_not_reported_as_acquired(env):
+    """Requirement D: handle-end (and any future strategy reusing
+    `verify_retained_during_lift`) must not report acquisition merely
+    because the object moved. Displaces the fork directly (simulating a
+    nudge with no actual grasp) -- no finger ever touched it, so contact
+    classification must show no intended_target contact regardless of the
+    object's new position."""
+    import mujoco
+
+    from aisummit.grasping.contact_strategies import verify_retained_during_lift
+
+    fork_jnt_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, "fork_free")
+    qadr = env.model.jnt_qposadr[fork_jnt_id]
+    env.data.qpos[qadr] += 0.05  # "moved" -- but never touched
+    mujoco.mj_forward(env.model, env.data)
+
+    acquired, contacts = verify_retained_during_lift(env, "left", "fork")
+    assert not acquired
+    assert not any(c.kind == "intended_target" for c in contacts)
+
+
+def test_successful_acquisition_requires_retention_during_lift(env):
+    """Requirement E: the positive case for the same check -- a real,
+    successful grasp (the cup, via the proven `pick()` path) must be
+    reported as retained during lift."""
+    from aisummit.control.primitives import pick
+    from aisummit.grasping.contact_strategies import verify_retained_during_lift
+
+    ctrl = env.current_ctrl()
+    pick(env, ctrl, side="right", object_name="cup")
+    acquired, contacts = verify_retained_during_lift(env, "right", "cup")
+    assert acquired
+    assert any(c.kind == "intended_target" for c in contacts)
+
+
+def test_cup_acquire_object_orchestrator_unchanged(env):
+    """Requirement F: the cup regression holds through the new
+    `acquire_object` orchestrator entrypoint, not just the underlying
+    `grasp_object`."""
+    from aisummit.grasping.planner import acquire_object
+
+    ctrl = env.current_ctrl()
+    result = acquire_object(env, ctrl, side="right", object_name="cup")
+    assert result.success
+    assert result.strategy == "conventional_bilateral_grasp"
+
+
+def test_knife_acquire_object_orchestrator_does_not_crash(env):
+    """Requirement G: the knife regression holds through the new
+    orchestrator -- it should try the conventional strategy, correctly
+    find it infeasible (same systemic table-clearance finding as the
+    fork), try handle-end, and return a clean failure without raising."""
+    from aisummit.grasping.planner import acquire_object
+
+    env.settle()
+    ctrl = env.current_ctrl()
+    result = acquire_object(env, ctrl, side="right", object_name="knife")
+    assert isinstance(result.success, bool)  # doesn't crash; real outcome, not asserted either way

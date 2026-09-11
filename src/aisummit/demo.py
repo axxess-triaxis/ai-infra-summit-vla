@@ -21,7 +21,7 @@ from PIL import Image
 
 from aisummit.control.primitives import place, place_oriented
 from aisummit.grasping.debug import GraspDebugTrace, draw_grasp_overlay
-from aisummit.grasping.planner import grasp_object
+from aisummit.grasping.planner import acquire_object
 from aisummit.planner.vla_planner import PlanStep, plan_from_instruction
 from aisummit.sim.env import DinnerTableEnv
 from aisummit.voice.speechmatics_client import stream_transcripts
@@ -45,11 +45,11 @@ def execute_plan(env: DinnerTableEnv, steps: list[PlanStep], debug: bool = False
             print(f"  {step.arm} arm: pick {step.object}")
             pre_grasp_frame = env.render()
             trace = GraspDebugTrace(object_name=step.object, verbose=debug)
-            result = grasp_object(env, ctrl, side=step.arm, object_name=step.object, debug=trace)
+            result = acquire_object(env, ctrl, side=step.arm, object_name=step.object, debug=trace)
             ctrl, obs = result.final_ctrl, obs
             held_quat[step.arm] = result.achieved_quat
             print(f"    grasp {'succeeded' if result.success else 'FAILED'}"
-                  f" ({len(trace.attempts)} attempt(s) tried)")
+                  f" (strategy={result.strategy}, {len(trace.attempts)} attempt(s) tried)")
             if debug:
                 print(trace.summary())
             if trace.geometry is not None and trace.geometry.is_elongated:

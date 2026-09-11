@@ -9,6 +9,8 @@ table underneath a normal approach, is expected and excluded.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import mujoco
 import numpy as np
 
@@ -67,3 +69,66 @@ def check_collision(
             return False, f"arm would penetrate the table/floor (dist={contact.dist:.4f})"
 
     return True, ""
+
+
+@dataclass
+class Contact:
+    body_a: str
+    body_b: str
+    dist: float
+    kind: str  # "intended_target" | "intended_support" | "table_penetration" | "unintended_collision"
+
+
+def classify_contacts(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    side: str,
+    arm_angles: np.ndarray,
+    target_object: str,
+    intended_support_bodies: frozenset[str] = frozenset(),
+) -> list[Contact]:
+    """Full-detail counterpart to `check_collision`: classifies every
+    contact the arm is party to instead of short-circuiting on the first
+    disqualifying one. "Contact is not collision" -- a strategy that
+    intentionally rests against the target object, or a designated
+    support/backstop body (e.g. the plate, for a future scooping
+    strategy), needs to tell that apart from an unintended collision or
+    real table penetration. `check_collision` itself is untouched -- every
+    existing caller keeps its exact current behavior; this is purely
+    additive, used by `grasping/contact_strategies.py`."""
+    scratch = mujoco.MjData(model)
+    scratch.qpos[:] = data.qpos
+    for j, joint_name in enumerate(ARM_JOINTS):
+        jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{side}/{joint_name}")
+        scratch.qpos[model.jnt_qposadr[jnt_id]] = arm_angles[j]
+    mujoco.mj_forward(model, scratch)
+
+    side_bodies = _side_body_ids(model, side)
+    target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, target_object)
+    support_body_ids = {
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name) for name in intended_support_bodies
+    }
+
+    contacts: list[Contact] = []
+    for i in range(scratch.ncon):
+        contact = scratch.contact[i]
+        body1, body2 = model.geom_bodyid[contact.geom1], model.geom_bodyid[contact.geom2]
+        bodies = {body1, body2}
+        if not (bodies & side_bodies):
+            continue
+
+        name1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body1) or "?"
+        name2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body2) or "?"
+
+        if target_body_id in bodies:
+            kind = "intended_target"
+        elif bodies & support_body_ids:
+            kind = "intended_support"
+        elif _WORLD_BODY_ID in bodies and contact.dist < _TABLE_PENETRATION_TOLERANCE:
+            kind = "table_penetration"
+        elif contact.dist <= 0.0:
+            kind = "unintended_collision"
+        else:
+            continue  # not actually touching, just close -- not worth classifying
+        contacts.append(Contact(body_a=name1, body_b=name2, dist=float(contact.dist), kind=kind))
+    return contacts

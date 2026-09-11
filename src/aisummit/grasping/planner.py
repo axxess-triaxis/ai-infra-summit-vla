@@ -42,6 +42,7 @@ class GraspResult:
     trace: GraspDebugTrace
     final_ctrl: np.ndarray
     achieved_quat: np.ndarray | None = None
+    strategy: str = "conventional_bilateral_grasp"
 
 
 def _verify_lifted(env: DinnerTableEnv, obs: Observation, object_name: str, side: str, start_height: float) -> bool:
@@ -222,3 +223,56 @@ def grasp_object(
     if allow_stabilization and stabilizer_side:
         ctrl = retract_arm(env, ctrl, stabilizer_side)
     return GraspResult(False, side, object_name, trace, ctrl)
+
+
+def acquire_object(
+    env: DinnerTableEnv, ctrl: np.ndarray, side: str, object_name: str,
+    weights: GraspWeights | None = None, debug: GraspDebugTrace | None = None,
+) -> GraspResult:
+    """Top-level entrypoint implementing "normal grasp is infeasible ->
+    try another contact strategy" rather than continuing to tune
+    conventional scoring: tries the conventional bilateral grasp first,
+    and only if that's infeasible, falls back to HANDLE_END_ACQUISITION
+    (grasping/contact_strategies.py). Radially symmetric objects never
+    reach the fallback -- `grasp_object`'s own early return for those,
+    and its untouched `pick()` path, are exactly as before.
+
+    Acceptance for the fallback is stricter than the conventional path's
+    `_verify_lifted` (position + tracking): `verify_retained_during_lift`
+    requires an actual finger-object contact at the moment of checking,
+    not just "the object moved" -- Phase 8's explicit concern that a
+    nudged-but-not-held object could otherwise be misreported as
+    acquired."""
+    result = grasp_object(env, ctrl, side, object_name, weights=weights, debug=debug)
+    if result.success:
+        return result
+
+    geometry = result.trace.geometry
+    if geometry is None or not geometry.is_elongated:
+        return result  # radial path (or geometry never estimated) -- no alternative strategy applies
+
+    from aisummit.grasping.contact_strategies import evaluate_handle_end_grasp, verify_retained_during_lift
+
+    outcome = evaluate_handle_end_grasp(env, side, geometry, weights)
+    result.trace.log(
+        f"conventional grasp infeasible -- tried handle_end_acquisition: "
+        f"{outcome.candidates_evaluated} evaluated, {outcome.ik_converged} IK-converged, "
+        f"feasible={outcome.feasible} ({outcome.reason})"
+    )
+    if not outcome.feasible or outcome.best_candidate is None:
+        return result  # both strategies exhausted -- return the conventional (failed) result, unchanged
+
+    cand = outcome.best_candidate
+    ctrl, _ = pick_oriented(
+        env, result.final_ctrl, side, cand.target_position, cand.target_quat, seed_angles=cand.seed_angles,
+        final_target_xyz=cand.final_target_position,
+    )
+    acquired, contacts = verify_retained_during_lift(env, side, object_name)
+    result.trace.log(
+        f"handle_end_acquisition attempt: acquired={acquired} "
+        f"contacts={[(c.body_a, c.body_b, c.kind) for c in contacts]}"
+    )
+    return GraspResult(
+        acquired, side, object_name, result.trace, ctrl,
+        achieved_quat=cand.target_quat if acquired else None, strategy="handle_end_acquisition",
+    )
