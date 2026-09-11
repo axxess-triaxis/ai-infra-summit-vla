@@ -22,6 +22,7 @@ import base64
 import io
 import json
 import os
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -32,6 +33,11 @@ from aisummit.sim.env import SIDES, TABLEWARE
 
 DEFAULT_BASE_URL = "https://api.groq.com/openai/v1"
 DEFAULT_MODEL = "qwen/qwen3.6-27b"
+# Groq's free tier caps this model's output at 1000 tokens/minute (hit
+# live: a 429 at max_tokens=1024, just over). The expected response here
+# is a short JSON array (a handful of pick/place steps), so 800 leaves
+# real margin without constraining genuine plans.
+_MAX_TOKENS = 800
 
 _SYSTEM_PROMPT = f"""You are the reasoning layer for a bimanual tabletop-manipulation robot \
 (two 6-DOF arms, "left" and "right", each with a parallel gripper) looking at an overhead \
@@ -43,14 +49,27 @@ each step one of:
   {{"arm": "left"|"right", "action": "place", "target_xyz": [x, y, z]}}
 
 Rules:
-- A "place" step must immediately follow the "pick" step for the same arm.
+- A "place" step must immediately follow the "pick" step for the same arm -- the SAME arm
+  that picks an object is the one that must place it, there is no handoff between arms.
 - target_xyz is in the robot's world frame (meters), where the table surface is z=0,
-  the left arm base is at roughly (-0.47, -0.02, 0.02), the right arm base at (0.47, -0.02, 0.02),
-  and reachable tabletop points are roughly x in [-0.35, 0.35], y in [-0.15, 0.30].
+  the left arm base is at roughly (-0.47, -0.02, 0.02), the right arm base at (0.47, -0.02, 0.02).
+- Each arm can only reach reliably within about 0.5m of its OWN base. Since the same arm must
+  both pick and place, never target a placement more than ~0.5m from that arm's base -- if the
+  instruction asks to move something toward the far/opposite side of the table, place it as far
+  in that direction as that arm can actually reach (a modest shift), not the extreme opposite
+  edge, since the arm doing the picking is also the one that has to reach the place target.
 - Use both arms in parallel where the instruction implies it (e.g. distinct objects, no shared target).
 - If the instruction is ambiguous or refers to an object not on the table, output an empty array [].
 - Output nothing except the JSON array -- no prose, no markdown fences.
-"""
+
+/no_think"""
+# Trailing /no_think is Qwen3's documented convention for skipping its
+# extended-thinking mode. Needed in practice, not just in theory: without
+# it, qwen3.6-27b spent its whole token budget on a <think>...</think>
+# block and got cut off before ever emitting JSON (found by printing the
+# raw response against a live key). Paired with `reasoning_effort: "none"`
+# in the actual API call below -- belt and suspenders, since only the
+# combination was confirmed to reliably suppress it.
 
 
 @dataclass
@@ -67,39 +86,45 @@ def _encode_frame(image: np.ndarray) -> str:
     return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
 
 
+_JSON_OBJECT_RE = re.compile(r"\{[^{}]*\}")
+
+
 def _extract_json_array(text: str) -> list[dict]:
+    """Parses the model's plan output, tolerating a real failure mode seen
+    live: qwen3.6-27b sometimes emits bare comma-separated objects
+    (`{...},\n{...}`) instead of wrapping them in `[...]` as instructed --
+    a small-model prompt-following slip, not a rare edge case worth
+    treating as a hard error. Tries a real `[...]` array first; falls back
+    to collecting every top-level `{...}` object (steps have no nested
+    braces, so a non-greedy regex is a safe, dependency-free stand-in for
+    a full parser here) and treating that list as the plan."""
     start, end = text.find("["), text.rfind("]")
-    if start == -1 or end == -1 or end < start:
-        raise ValueError(f"No JSON array found in model output: {text!r}")
-    return json.loads(text[start : end + 1])
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+    objects = _JSON_OBJECT_RE.findall(text)
+    if not objects:
+        raise ValueError(f"No JSON array or objects found in model output: {text!r}")
+    return [json.loads(obj) for obj in objects]
 
 
-def plan_from_instruction(
-    image: np.ndarray,
-    instruction: str,
-    api_key: str | None = None,
-    model: str = DEFAULT_MODEL,
-    base_url: str = DEFAULT_BASE_URL,
-) -> list[PlanStep]:
-    """One multimodal reasoning call -> a validated list of PlanStep.
+# Small models occasionally drop a required field or otherwise emit a
+# malformed step even with the parsing fixes above -- confirmed live: one
+# real call returned {"action": "pick"} with no "arm" key at all, while an
+# identical call moments later returned a perfectly-formed plan. That's
+# ordinary LLM run-to-run variance, not a parsing bug, and the standard
+# mitigation is a retry, not a more elaborate parser chasing every
+# possible malformation.
+_MAX_ATTEMPTS = 3
 
-    Raises ValueError if the model's output isn't parseable JSON, or a step
-    references an arm/action/object outside the known sets -- callers should
-    fall back to a scripted/no-op behavior rather than execute garbage.
 
-    Reads `LLM_API_KEY`/`LLM_MODEL`/`LLM_BASE_URL` from the environment if
-    the matching argument isn't passed explicitly, falling back to
-    `GROQ_API_KEY` for the key specifically (the common case of "just set
-    the Groq key and go").
-    """
-    client = OpenAI(
-        api_key=api_key or os.environ.get("LLM_API_KEY") or os.environ.get("GROQ_API_KEY"),
-        base_url=os.environ.get("LLM_BASE_URL", base_url),
-    )
-    resolved_model = os.environ.get("LLM_MODEL", model)
+def _one_attempt(client: OpenAI, model: str, image: np.ndarray, instruction: str) -> list[PlanStep]:
     response = client.chat.completions.create(
-        model=resolved_model,
-        max_tokens=1024,
+        model=model,
+        max_tokens=_MAX_TOKENS,
+        extra_body={"reasoning_effort": "none"},
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
             {
@@ -134,3 +159,38 @@ def plan_from_instruction(
             )
         )
     return steps
+
+
+def plan_from_instruction(
+    image: np.ndarray,
+    instruction: str,
+    api_key: str | None = None,
+    model: str = DEFAULT_MODEL,
+    base_url: str = DEFAULT_BASE_URL,
+) -> list[PlanStep]:
+    """One multimodal reasoning call -> a validated list of PlanStep,
+    retried up to `_MAX_ATTEMPTS` times on a malformed response.
+
+    Raises the last ValueError if every attempt's output isn't parseable
+    JSON, or references an arm/action/object outside the known sets --
+    callers should fall back to a scripted/no-op behavior rather than
+    execute garbage.
+
+    Reads `LLM_API_KEY`/`LLM_MODEL`/`LLM_BASE_URL` from the environment if
+    the matching argument isn't passed explicitly, falling back to
+    `GROQ_API_KEY` for the key specifically (the common case of "just set
+    the Groq key and go").
+    """
+    client = OpenAI(
+        api_key=api_key or os.environ.get("LLM_API_KEY") or os.environ.get("GROQ_API_KEY"),
+        base_url=os.environ.get("LLM_BASE_URL", base_url),
+    )
+    resolved_model = os.environ.get("LLM_MODEL", model)
+
+    last_error: Exception | None = None
+    for _ in range(_MAX_ATTEMPTS):
+        try:
+            return _one_attempt(client, resolved_model, image, instruction)
+        except (ValueError, json.JSONDecodeError) as e:
+            last_error = e
+    raise last_error

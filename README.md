@@ -425,3 +425,42 @@ recording.
 
 - **Object set is four primitives**, not photorealistic tableware meshes -- fine for a
   reasoning/manipulation demo, not for a visual polish pass.
+
+## First live end-to-end run (`demo.py`)
+
+Anthropic's API isn't free, so the planner switched providers (see `planner/vla_planner.py`'s
+docstring) to Groq, which offers a genuine free tier -- confirmed live against
+`console.groq.com/docs/vision` that `qwen/qwen3.6-27b` and `qwen/qwen3.8-27b` are currently the
+only two vision-capable models Groq hosts. With a real key, this uncovered three real, fixable
+issues before the pipeline ran successfully for the first time ever (no `outputs/` directory
+had existed before this):
+
+1. **Groq's free tier caps this model's output at 1000 tokens/minute** -- `max_tokens=1024`
+   (an arbitrary default) triggered an immediate 429. Dropped to 800, which the actual expected
+   response (a short JSON plan) never gets close to.
+2. **qwen3.6-27b is a reasoning model** -- it spent its whole token budget on a
+   `<think>...</think>` block and got cut off before ever emitting JSON, confirmed by printing
+   the raw response. Fixed with Qwen3's documented `/no_think` prompt suffix plus
+   `extra_body={"reasoning_effort": "none"}` in the request -- neither alone was confirmed
+   sufficient, only the combination.
+3. **Occasional malformed output** -- one live call returned bare comma-separated objects
+   without the enclosing `[...]` the prompt asked for; a separate call returned
+   `{"action": "pick"}` with no `"arm"` key at all, while an identical call moments later
+   returned a clean plan. Ordinary small-model run-to-run variance, not a parsing bug --
+   addressed with a tolerant parser fallback (collects bare `{...}` objects if no valid array
+   is found) plus a 3-attempt retry, the standard mitigation for this rather than an
+   ever-more-elaborate single-shot parser.
+
+**A fourth issue surfaced from the first real full-pipeline run**, not the planner in
+isolation: asked to move the cup "to the left side of the table," the model (correctly) chose
+the right arm to pick it up (closer to the cup), then also assigned that same arm a place
+target on the literal opposite edge, 0.72m from its own base -- well beyond `move_to`'s
+single-shot reach. The cup moved partway (confirmed: `x=0.284 -> 0.065` against a requested
+`x=-0.25`) and stopped, silently, since `place()` has no success/failure check the way `pick()`
+does. Fixed at the prompt level, not by rewriting placement: the system prompt now states each
+arm's own comfortable reach (~0.5m from its base) and instructs the model to place within that,
+even when the instruction implies "the other side" -- since the same arm that picks must also
+place, there's no handoff in the current plan schema. Re-run after the fix: the model targeted
+a placement within the right arm's actual reach, and the cup visibly moved from the far-right
+corner toward center-left in the saved `outputs/after.png` -- a real, achievable plan, not the
+literal "far left" the instruction's wording alone would suggest, but a working one.
