@@ -1,12 +1,20 @@
 """Multi-modal reasoning layer for the bimanual dinner-table task.
 
 This is the "VLA" in the Intel Online track's framing, scoped realistically
-for a one-week hackathon: rather than training VLA model weights, a
-vision-capable Claude call plays the reasoning role -- look at the rendered
-scene, read the instruction (typed OR transcribed from Speechmatics), and
-emit a structured pick/place plan. The low-level control/ package turns that
-plan into real joint targets; this module never touches joint angles.
-"""
+for a hackathon: rather than training VLA model weights, a vision-capable
+LLM call plays the reasoning role -- look at the rendered scene, read the
+instruction (typed OR transcribed from Speechmatics), and emit a structured
+pick/place plan. The low-level control/ package turns that plan into real
+joint targets; this module never touches joint angles.
+
+Provider: any OpenAI-compatible chat-completions endpoint -- Groq by
+default, since Groq currently offers exactly two vision-capable models
+(confirmed live against console.groq.com/docs/vision: qwen/qwen3.6-27b and
+qwen/qwen3.8-27b are the only multimodal ones on their platform right now;
+their Llama/GPT-OSS models are text-only). Switching to OpenRouter or any
+other OpenAI-compatible provider is a matter of changing three env vars
+(LLM_BASE_URL/LLM_API_KEY/LLM_MODEL), not code, since both speak the same
+chat-completions shape `openai`'s SDK already implements."""
 
 from __future__ import annotations
 
@@ -17,12 +25,13 @@ import os
 from dataclasses import dataclass
 
 import numpy as np
-from anthropic import Anthropic
+from openai import OpenAI
 from PIL import Image
 
 from aisummit.sim.env import SIDES, TABLEWARE
 
-DEFAULT_MODEL = "claude-sonnet-5"
+DEFAULT_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_MODEL = "qwen/qwen3.6-27b"
 
 _SYSTEM_PROMPT = f"""You are the reasoning layer for a bimanual tabletop-manipulation robot \
 (two 6-DOF arms, "left" and "right", each with a parallel gripper) looking at an overhead \
@@ -70,36 +79,42 @@ def plan_from_instruction(
     instruction: str,
     api_key: str | None = None,
     model: str = DEFAULT_MODEL,
+    base_url: str = DEFAULT_BASE_URL,
 ) -> list[PlanStep]:
     """One multimodal reasoning call -> a validated list of PlanStep.
 
     Raises ValueError if the model's output isn't parseable JSON, or a step
     references an arm/action/object outside the known sets -- callers should
     fall back to a scripted/no-op behavior rather than execute garbage.
+
+    Reads `LLM_API_KEY`/`LLM_MODEL`/`LLM_BASE_URL` from the environment if
+    the matching argument isn't passed explicitly, falling back to
+    `GROQ_API_KEY` for the key specifically (the common case of "just set
+    the Groq key and go").
     """
-    client = Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
-    response = client.messages.create(
-        model=model,
+    client = OpenAI(
+        api_key=api_key or os.environ.get("LLM_API_KEY") or os.environ.get("GROQ_API_KEY"),
+        base_url=os.environ.get("LLM_BASE_URL", base_url),
+    )
+    resolved_model = os.environ.get("LLM_MODEL", model)
+    response = client.chat.completions.create(
+        model=resolved_model,
         max_tokens=1024,
-        system=_SYSTEM_PROMPT,
         messages=[
+            {"role": "system", "content": _SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": [
                     {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": _encode_frame(image),
-                        },
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{_encode_frame(image)}"},
                     },
                     {"type": "text", "text": instruction},
                 ],
-            }
+            },
         ],
     )
-    text = "".join(block.text for block in response.content if block.type == "text")
+    text = response.choices[0].message.content or ""
     raw_steps = _extract_json_array(text)
 
     steps = []

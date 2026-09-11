@@ -39,22 +39,26 @@ typed text  ------------------------------- /              |
   native position actuators. This is the only thing the planner's output ever drives --
   it never sees a joint angle.
 - **`planner/vla_planner.py`** -- the "VLA" reasoning layer. Sends the overhead camera
-  render + the instruction to Claude (`claude-sonnet-5`, vision-capable) with a system
-  prompt describing the two arms and the four objects, gets back a structured JSON plan.
-  Training real VLA weights in a one-week hackathon isn't realistic; a multimodal LLM doing
-  the "what to do" reasoning while `control/` does deterministic "how to move it" is the
-  scoped-realistic version of the same idea.
+  render + the instruction to a vision-capable LLM (Groq's `qwen/qwen3.6-27b` by default --
+  confirmed live against `console.groq.com/docs/vision` as one of exactly two multimodal
+  models Groq currently offers; any other OpenAI-compatible provider works by setting
+  `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL` instead, no code change) with a system prompt
+  describing the two arms and the four objects, gets back a structured JSON plan. Training
+  real VLA weights in a hackathon isn't realistic; a multimodal LLM doing the "what to do"
+  reasoning while `control/` does deterministic "how to move it" is the scoped-realistic
+  version of the same idea.
 - **`voice/speechmatics_client.py`** -- real-time transcription over Speechmatics'
-  WebSocket protocol. **Not yet tested against a real Speechmatics key** (none was available
-  while building this) -- see the module docstring for exactly what to verify against
-  `docs.speechmatics.com` before the actual demo.
+  WebSocket protocol. **Verified against a real key and account** (see "Speechmatics -- now
+  verified live" below) -- connects, authenticates, and completes the full message sequence
+  correctly. Not yet tested with real spoken words (only synthesized tones, to isolate
+  protocol correctness from transcription content).
 - **`demo.py`** -- the single entrypoint, `--input text` or `--input voice`.
 
 ## Setup
 
 ```bash
 uv sync
-cp .env.example .env   # fill in ANTHROPIC_API_KEY and SPEECHMATICS_API_KEY
+cp .env.example .env   # fill in GROQ_API_KEY and SPEECHMATICS_API_KEY
 ```
 
 The ALOHA model assets (`assets/mujoco_menagerie/aloha/`, ~20MB) are already vendored in
