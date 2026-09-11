@@ -48,7 +48,7 @@ class GraspDebugTrace:
         self.candidates.append(trace)
         reason = trace.rejection_reason or "ok"
         if trace.metrics is None:
-            self.log(f"candidate {trace.source}: score=n/a accepted={trace.accepted} ({reason})")
+            self.log(f"candidate {trace.source}: score=n/a feasible={trace.accepted} ({reason})")
             return
         m = trace.metrics
         self.log(
@@ -58,7 +58,7 @@ class GraspDebugTrace:
             f"finger_left_z={m.finger_left_z:.4f} finger_right_z={m.finger_right_z:.4f} "
             f"finger_height_mismatch_mm={m.finger_height_mismatch * 1000:.1f} "
             f"clearance_ok={m.collision_valid} IK_success={m.ik_ok} "
-            f"total_score={m.score:.3f} accepted={trace.accepted} reason={reason}"
+            f"total_score={m.score:.3f} feasible={trace.accepted} reason={reason}"
         )
 
     def record_attempt(self, attempt: AttemptTrace) -> None:
@@ -86,6 +86,43 @@ class GraspDebugTrace:
         print(f"  IK: {'SUCCESS' if m.ik_ok else 'FAILED'}")
         print(f"  collision: {'CLEAR' if m.collision_valid else 'BLOCKED'}")
         print(f"  candidate score: {m.score:.3f}")
+
+    def spatial_search_summary(self) -> str:
+        """The STEP-5-style report for a full candidate search: how many
+        candidates were evaluated, how many converged, how many were
+        feasible, and the best of each of the feasible/infeasible groups --
+        answers "does a viable grasp window exist at all" independent of
+        whether any attempt was actually verified as successful."""
+        with_metrics = [c for c in self.candidates if c.metrics is not None]
+        ik_converged = [c for c in with_metrics if c.metrics.ik_ok]
+        feasible = [c for c in with_metrics if c.accepted]
+        infeasible = [c for c in with_metrics if not c.accepted]
+
+        lines = [
+            f"Spatial search summary for {self.object_name!r}:",
+            f"  candidates evaluated: {len(with_metrics)}",
+            f"  IK-converged: {len(ik_converged)}",
+            f"  geometrically feasible: {len(feasible)}",
+        ]
+        if feasible:
+            best = max(feasible, key=lambda c: c.metrics.score)
+            m = best.metrics
+            lines.append(
+                f"  best feasible: {best.source} score={m.score:.3f} "
+                f"align={m.orientation_alignment:.2f} mismatch_mm={m.finger_height_mismatch * 1000:.1f} "
+                f"pos_err_mm={m.ik_position_error * 1000:.1f}"
+            )
+        else:
+            lines.append("  best feasible: none")
+        if infeasible:
+            best_infeasible = max(infeasible, key=lambda c: c.metrics.score)
+            m = best_infeasible.metrics
+            lines.append(
+                f"  best infeasible: {best_infeasible.source} score={m.score:.3f} "
+                f"align={m.orientation_alignment:.2f} mismatch_mm={m.finger_height_mismatch * 1000:.1f} "
+                f"reason={best_infeasible.rejection_reason}"
+            )
+        return "\n".join(lines)
 
     def summary(self) -> str:
         lines = [f"Grasp trace for {self.object_name!r}:"]

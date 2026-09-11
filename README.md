@@ -230,6 +230,72 @@ not an orientation surprise, not a friction/force issue -- a fixed ~5.5cm gap be
 fingers' heights that no amount of retry or re-scoring within the current candidate space
 closes. The cup and plate grasp reliably throughout all of this (verified after every change,
 including the finer wrist sweep and both scoring changes).
+
+## Spatial repositioning search
+
+Next question tested: does moving the grasp POINT (not just the wrist orientation) around the
+fork open a feasible bilateral grasp? Answered experimentally, not assumed.
+
+- `geometry.py::transverse_axis_h()` -- unit horizontal vector perpendicular to the object's
+  principal axis, reusing the existing axis abstraction rather than inventing a second one.
+- `candidates.py` -- `generate_candidates` now varies the grasp point across a small star
+  pattern (each offset axis independently around the base point, not a full grid): 3
+  longitudinal offsets (unchanged) + 2 new transverse offsets = 5 spatial points, each still
+  swept across the full 37-angle wrist range (185 candidates total, not the "huge brute-force
+  grid" the brief explicitly ruled out). World-frame X/Y offsets aren't a separate dimension:
+  the fork/knife have zero rotation, so their principal/transverse axes already ARE world Y/X --
+  a separate world-frame sweep would just repeat the same numbers under different labels. The
+  mechanism itself is general (object-relative axes), not fork-specific.
+- `scoring.py` -- feasibility is now an explicit, separate classification from score
+  (`GraspMetrics.feasible`/`infeasible_reason`), not just a low weighted number. A new
+  `_finger_reaches_object()` check catches something the mismatch-only metric structurally
+  cannot: two fingers can be perfectly symmetric with each other while BOTH floating equally
+  far from the object. `evaluate_candidate` now checks, in order, `ik_ok` -> `collision_valid`
+  -> each finger individually within `thickness + 5mm` of the object's own height -> mismatch
+  within tolerance -- any failure makes the candidate infeasible outright, regardless of how
+  high its alignment score is.
+- `planner.py` -- `grasp_object`'s filtering loop now gates on `metrics.feasible` directly
+  (folding what used to be two separate `collision_valid`/`ik_ok` checks into one, richer
+  classification) instead of scoring a physically-impossible candidate down and hoping it loses.
+- `debug.py` -- new `GraspDebugTrace.spatial_search_summary()`: candidates evaluated,
+  IK-converged, geometrically feasible, and the best of each of the feasible/infeasible groups.
+
+**This stricter check surfaced a second, independent problem**, on top of the wrist-tilt
+coupling from the previous iteration: `_GRASP_HEIGHT_CLEARANCE` (added earlier so the gripper
+mechanism clears the table at wide wrist angles) is applied to the literal close point, not
+just an approach waypoint -- `pick_oriented` is deliberately single-stage (see its docstring:
+a two-waypoint version caused a worse kinematic elbow-flip), so there is no separate descent
+back down to the object's real height before closing. Measured directly: the nominal target
+sits ~30mm above the fork's actual surface, for *every* candidate, regardless of wrist angle or
+spatial offset. Lowering the clearance to compensate was also tried and measured: at any
+clearance low enough to bring the fingers within reach, the well-aligned wrist angles go back
+to penetrating the table -- the exact problem the clearance was added to fix in the first
+place. This is a genuine height-vs-clearance conflict, independent of horizontal position.
+
+**Experimental answer to the assigned question:** across all 5 spatial offsets, swept against
+6 clearance heights (12mm-30mm) and a fine wrist sweep (50-130 degrees in 5-degree steps) --
+30 x 17 = 510 combinations per spatial point, 2,550 total -- zero candidates are simultaneously
+collision-free, within IK tolerance, well-aligned (>0.5), and within finger-reach of the fork.
+**Moving the grasp point horizontally does not open a feasible bilateral grasp window at the
+fork's current pose.** The production search (default clearance, no manual override) reports
+the same result cleanly: `candidates evaluated: 185, IK-converged: 94 (left) / 185 (right),
+geometrically feasible: 0` for both arms, best infeasible candidate `align=0.97, mismatch=9.3mm,
+reason="neither finger reaches the object"`.
+
+No physical APPROACH->CLOSE->HOLD->LIFT run was performed this iteration: the brief is explicit
+that faking a success when no feasible candidate exists is worse than reporting the negative
+result, and every avenue this pipeline currently searches (wrist orientation, grasp height,
+horizontal position, both arms) converges on the same conclusion.
+
+**Next geometric intervention** (not attempted here -- out of this iteration's scope, which was
+horizontal position only): decouple "approach clearance for table avoidance" from "final close
+height" in `pick_oriented`, most plausibly via a controlled *translation-only* final descent
+after the orientation is already locked in (translation-only should not reintroduce the
+elbow-flip a full 6-DOF two-waypoint solve caused previously, since the hard part --
+orientation -- would already be solved before descending). This is a real code change to
+`control/primitives.py`, not a scoring or search-space tweak, which is why it wasn't done as
+part of a "search object/approach position" task.
+
 - **Speechmatics integration is unverified.** Implemented from documented protocol knowledge,
   not tested against a live key. Confirm the auth flow (bearer key vs. short-lived JWT
   exchange) and endpoint region before the actual demo.

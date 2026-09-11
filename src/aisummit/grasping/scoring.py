@@ -72,6 +72,10 @@ class GraspMetrics:
     finger_right_z: float
     finger_height_mismatch: float
     finger_height_symmetry_score: float
+    left_finger_reaches_object: bool
+    right_finger_reaches_object: bool
+    feasible: bool
+    infeasible_reason: str
     score: float = 0.0
 
 
@@ -89,6 +93,20 @@ def stability_score(geometry: ObjectGeometry) -> float:
     if width >= GRIPPER_OPEN * 2:  # each finger travels GRIPPER_OPEN from center, roughly
         return 0.0
     return float(np.clip(1.0 - width / (GRIPPER_OPEN * 2), 0.0, 1.0))
+
+
+def _finger_reaches_object(finger_z: float, geometry: ObjectGeometry) -> bool:
+    """Whether a single finger's height is anywhere near the object's own
+    vertical extent -- distinct from finger_height_mismatch (which only
+    compares the two fingers to EACH OTHER, so a candidate with both
+    fingers equally far above the object would score perfectly symmetric
+    while still touching nothing). Found necessary by direct measurement:
+    the fork's best-aligned candidate had left_finger at 20.8mm and
+    right_finger at 61.1mm while the fork itself spans roughly
+    [-1.9mm, 6.1mm] -- neither finger individually reaches, which a
+    symmetry-only check cannot see."""
+    obj_z = geometry.position[2]
+    return bool(abs(finger_z - obj_z) <= geometry.thickness + _FINGER_HEIGHT_MARGIN_M)
 
 
 def evaluate_candidate(
@@ -157,6 +175,30 @@ def evaluate_candidate(
     finger_height_mismatch = float(abs(left_finger_pos[2] - right_finger_pos[2]))
     allowed_height_mismatch = 2.0 * geometry.thickness + _FINGER_HEIGHT_MARGIN_M
     finger_height_symmetry_score = float(np.clip(1.0 - finger_height_mismatch / allowed_height_mismatch, 0.0, 1.0))
+    left_reaches = _finger_reaches_object(float(left_finger_pos[2]), geometry)
+    right_reaches = _finger_reaches_object(float(right_finger_pos[2]), geometry)
+
+    # FEASIBILITY is a hard classification, separate from the weighted
+    # SCORE below -- a candidate that fails any of these is physically
+    # incapable of the grasp, and no amount of alignment should buy it a
+    # win (requirement: "do not allow a very high alignment score to
+    # compensate for a physically impossible bilateral grasp"). Checked in
+    # a fixed order so `infeasible_reason` names the first real problem,
+    # not just "infeasible".
+    if not ik_ok:
+        feasible, infeasible_reason = False, "IK did not converge"
+    elif not collision_valid:
+        feasible, infeasible_reason = False, collision_reason
+    elif not left_reaches and not right_reaches:
+        feasible, infeasible_reason = False, "neither finger reaches the object"
+    elif not left_reaches:
+        feasible, infeasible_reason = False, "left finger cannot reach the object"
+    elif not right_reaches:
+        feasible, infeasible_reason = False, "right finger cannot reach the object"
+    elif finger_height_symmetry_score <= 0.0:
+        feasible, infeasible_reason = False, "finger-height mismatch exceeds object-aware tolerance"
+    else:
+        feasible, infeasible_reason = True, ""
 
     metrics = GraspMetrics(
         ik_position_error=pos_err,
@@ -173,6 +215,10 @@ def evaluate_candidate(
         finger_right_z=float(right_finger_pos[2]),
         finger_height_mismatch=finger_height_mismatch,
         finger_height_symmetry_score=finger_height_symmetry_score,
+        left_finger_reaches_object=left_reaches,
+        right_finger_reaches_object=right_reaches,
+        feasible=feasible,
+        infeasible_reason=infeasible_reason,
     )
 
     total = weights.total()

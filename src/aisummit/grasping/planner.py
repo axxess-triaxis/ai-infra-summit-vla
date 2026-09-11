@@ -161,25 +161,23 @@ def grasp_object(
     for cand in candidates:
         solved_angles = _solve_matching_execution(env, side, cand)
         metrics = evaluate_candidate(env.model, env.data, cand, geometry, solved_angles, weights)
-        if not metrics.collision_valid:
-            trace.record_candidate(CandidateTrace(cand.source, metrics, False, metrics.collision_reason))
+        # FEASIBILITY (ik_ok, collision_valid, both fingers actually reach
+        # the object, finger-height mismatch within tolerance) is a hard
+        # gate, not a scoring input -- a candidate failing any of these is
+        # physically incapable of the grasp, and no alignment score should
+        # buy it a win. `metrics.feasible` already folds all four checks
+        # together (scoring.py); `workspace_margin` deliberately stays OUT
+        # of that gate -- it's an admitted approximation (see scoring.py's
+        # _NOMINAL_MAX_REACH_M docstring) that once rejected a candidate
+        # ik_ok and collision_valid both confirmed as genuinely reachable
+        # (right arm reaching across for the fork, 0.69m from its base).
+        trace.record_candidate(CandidateTrace(cand.source, metrics, metrics.feasible, metrics.infeasible_reason))
+        if not metrics.feasible:
             continue
-        # workspace_margin is an admitted approximation (see scoring.py's
-        # _NOMINAL_MAX_REACH_M docstring) -- it stays a continuous, weighted
-        # scoring signal but is NOT a hard reject gate. It was rejecting a
-        # candidate that ik_ok and collision_valid both confirmed as a real,
-        # reachable, collision-free solution (right arm reaching across for
-        # the fork, 0.69m from its base -- comfortably beyond the 0.5m
-        # guess). ik_ok and collision_valid are exact simulator facts;
-        # workspace_margin is not, so it shouldn't get veto power over them.
-        if not metrics.ik_ok:
-            trace.record_candidate(CandidateTrace(cand.source, metrics, False, "IK did not converge"))
-            continue
-        trace.record_candidate(CandidateTrace(cand.source, metrics, True))
         scored.append((metrics.score, cand, solved_angles))
 
     if not scored:
-        trace.log("no valid candidates survived filtering/scoring")
+        trace.log("no feasible candidates survived filtering/scoring")
         if allow_stabilization and stabilizer_side:
             ctrl = retract_arm(env, ctrl, stabilizer_side)
         return GraspResult(False, side, object_name, trace, ctrl)

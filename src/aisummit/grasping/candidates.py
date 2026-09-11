@@ -23,6 +23,27 @@ theoretical elegance -- see control/ik.py's docstring and the README's
    fingers to close across the object's width rather than along its length.
 4. Feed the resulting (position, quaternion) pair into the *extended*
    `solve_ik(..., target_quat=...)` for a final precise 6-DOF solve.
+
+Spatial search (added after the wrist-only search hit a wall -- see
+README's "spatial repositioning" section): the wrist sweep alone changes
+*orientation* around a fixed grasp point, but measurement showed the
+~9mm finger-height mismatch near the well-aligned region was constant
+across wrist angles, grasp heights, and both arms at the *current* grasp
+point -- a real kinematic coupling at that specific reach, not something
+orientation search alone can escape. `generate_candidates` now also
+varies the grasp POINT itself by a small, bounded set of horizontal
+offsets (longitudinal + transverse, using the object-relative axes
+`geometry.principal_axis` and `geometry.transverse_axis_h` already
+exposed by geometry.py) before running the same wrist sweep at each one.
+This is a star pattern (each offset axis varied independently around the
+base point), not a full 2D grid, to keep the search bounded: 5 spatial
+points x 37 wrist angles, not 3x3x37. World-frame X/Y offsets are not
+swept as a separate dimension: for a box object with zero rotation (the
+fork/knife's authored pose), the principal/transverse axes already ARE
+world Y/X, so a separate world-frame sweep would just re-run the same
+numbers under different labels -- the object-relative axes are the
+general mechanism (they still work if that assumption stops holding for
+a future rotated object), not a fork-specific shortcut.
 """
 
 from __future__ import annotations
@@ -33,10 +54,16 @@ import mujoco
 import numpy as np
 
 from aisummit.control.ik import solve_ik
-from aisummit.grasping.geometry import ObjectGeometry
+from aisummit.grasping.geometry import ObjectGeometry, transverse_axis_h
 from aisummit.sim.env import ARM_JOINTS
 
-_POSITION_OFFSETS = (-0.015, 0.0, 0.015)  # meters, along the object's principal axis
+_LONGITUDINAL_OFFSETS = (-0.015, 0.0, 0.015)  # meters, along the object's principal axis
+# Small and separate from the longitudinal set on purpose (a star pattern,
+# not a grid) -- see module docstring's "Spatial search" section for why
+# this dimension exists at all: wrist orientation alone plateaus at a
+# fixed ~9mm finger-height mismatch regardless of angle, so the search now
+# also asks whether a nearby grasp POINT changes that coupling.
+_TRANSVERSE_OFFSETS = (-0.01, 0.01)  # meters, perpendicular to the object's principal axis
 # The authored handle site sits at the object's exact centerline height,
 # right at the tabletop -- fine for *where* to grasp, but it leaves the
 # gripper's body almost no vertical clearance before wider wrist angles
@@ -59,13 +86,28 @@ _GRASP_HEIGHT_CLEARANCE = 0.03
 _WRIST_SWEEP_DEG = tuple(range(0, 181, 5))  # degrees; 180 deg-periodic for a parallel gripper
 
 
+def _spatial_offsets(
+    longitudinal_offsets: tuple[float, ...], transverse_offsets: tuple[float, ...]
+) -> list[tuple[float, float]]:
+    """Star pattern around (0, 0): every longitudinal offset at zero
+    transverse, plus every nonzero transverse offset at zero longitudinal.
+    5 points for the current defaults (3 + 2), not the 3x2=6-plus-overlap
+    a full grid would give -- deliberately small per the brief's "do not
+    create a huge brute-force grid"."""
+    points = [(lon, 0.0) for lon in longitudinal_offsets]
+    points += [(0.0, trans) for trans in transverse_offsets if trans != 0.0]
+    return points
+
+
 @dataclass
 class GraspCandidate:
     side: str
     target_position: np.ndarray
     target_quat: np.ndarray
-    source: str  # human-readable provenance, e.g. "offset=+0.015,wrist=90deg"
+    source: str  # human-readable provenance, e.g. "long=+0.015,trans=+0.000,wrist=90deg"
     closing_axis_alignment: float  # 0..1, 1 = perfectly perpendicular to the object's axis
+    longitudinal_offset: float = 0.0  # meters, along the object's principal axis
+    transverse_offset: float = 0.0  # meters, along the object's transverse axis
     seed_angles: np.ndarray | None = None  # warm-start for the final 6-DOF solve -- see solve_ik's docstring
 
 
@@ -96,18 +138,20 @@ def generate_candidates(
     data: mujoco.MjData,
     side: str,
     geometry: ObjectGeometry,
-    position_offsets: tuple[float, ...] = _POSITION_OFFSETS,
+    longitudinal_offsets: tuple[float, ...] = _LONGITUDINAL_OFFSETS,
+    transverse_offsets: tuple[float, ...] = _TRANSVERSE_OFFSETS,
     wrist_sweep_deg: tuple[float, ...] = _WRIST_SWEEP_DEG,
 ) -> list[GraspCandidate]:
     base_point = geometry.grasp_region if geometry.grasp_region is not None else geometry.position
     base_point = base_point + np.array([0, 0, _GRASP_HEIGHT_CLEARANCE])
     axis_h = _horizontal_unit(geometry.principal_axis)
+    trans_h = transverse_axis_h(geometry)
     wrist_jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{side}/wrist_rotate")
     wrist_qadr = model.jnt_qposadr[wrist_jnt_id]
 
     candidates: list[GraspCandidate] = []
-    for offset in position_offsets:
-        target_pos = base_point + offset * axis_h
+    for lon_offset, trans_offset in _spatial_offsets(longitudinal_offsets, transverse_offsets):
+        target_pos = base_point + lon_offset * axis_h + trans_offset * trans_h
         seed_angles = solve_ik(model, data, side, target_pos)  # unmodified position-only IK, reused as-is
 
         for wrist_deg in wrist_sweep_deg:
@@ -133,8 +177,10 @@ def generate_candidates(
                     side=side,
                     target_position=target_pos,
                     target_quat=quat,
-                    source=f"offset={offset:+.3f},wrist={wrist_deg}deg",
+                    source=f"long={lon_offset:+.3f},trans={trans_offset:+.3f},wrist={wrist_deg}deg",
                     closing_axis_alignment=alignment,
+                    longitudinal_offset=lon_offset,
+                    transverse_offset=trans_offset,
                     seed_angles=wrist_overridden_angles,
                 )
             )

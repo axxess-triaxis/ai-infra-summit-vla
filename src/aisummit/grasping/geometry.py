@@ -45,6 +45,18 @@ class ObjectGeometry:
     unsafe_region: np.ndarray | None  # world xyz of a blade/unsafe site, if any
 
 
+def transverse_axis_h(geometry: ObjectGeometry) -> np.ndarray:
+    """Unit horizontal vector perpendicular to the object's principal axis
+    -- its "width" direction. Used by grasp candidate search (candidates.py)
+    to test spatial offsets that aren't purely along the object's length,
+    reusing the same axis abstraction rather than inventing a second one."""
+    axis = geometry.principal_axis.copy()
+    axis[2] = 0.0
+    norm = np.linalg.norm(axis)
+    axis_h = axis / norm if norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+    return np.array([-axis_h[1], axis_h[0], 0.0])
+
+
 def _site_world_pos(model: mujoco.MjModel, data: mujoco.MjData, site_name: str) -> np.ndarray | None:
     site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name)
     if site_id == -1:
