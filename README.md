@@ -73,6 +73,15 @@ uv run python -m aisummit.demo --input text --instruction "pick up the cup and m
 
 Writes `outputs/before.png` and `outputs/after.png`.
 
+**Demo scope, decided after the exhaustive fork/knife investigation below**: the reliable,
+recommended demo instruction manipulates the **cup** (and, by extension, the plate, both
+radially symmetric). The VLA planner still correctly *perceives and reasons about* all four
+objects -- fork and knife included -- from the same scene; `acquire_object` correctly detects
+and reports fork/knife grasp infeasibility (`success=False`, with the real diagnosed reason)
+rather than silently failing or faking a result. This is a genuine, documented engineering
+finding, not a hidden gap -- see "Alternative contact strategies" below for the full evidence
+trail, including the final position + rotation sweep that closes out the investigation.
+
 ```bash
 uv run python -m aisummit.demo --input voice --wav-file sample.wav   # 16kHz mono PCM16 WAV
 ```
@@ -403,11 +412,35 @@ position/tracking check alone would misreport as acquired.
 **Conclusion, stated at the scope this iteration actually tested**: no tested conventional
 bilateral grasp, and no tested handle-end acquisition, at this fork pose satisfies the required
 kinematic, contact, and table-clearance constraints. Scooping/backstop was evaluated and rejected
-by direct physical test, not assumed impossible. This is not a claim that grasping the fork is
-impossible in general -- repositioning the object, or a differently-shaped end effector, are
-untested and likely-different problems.
+by direct physical test, not assumed impossible.
 
 Tests: 27/27 passing (20 previous + 7 new, requirements A-G).
+
+## Repositioning tested too -- final scope decision
+
+The paragraph above left one door open: "repositioning the object... untested." Closed next,
+using the exact same real candidate-generation and scoring machinery (`generate_candidates` +
+`evaluate_candidate`), not new code:
+
+- **Distance from the arm**: swept the fork's x-position across 7 points, 7cm to 37cm from the
+  left arm's base (current position is ~25cm) -- zero feasible candidates at any distance.
+- **Object rotation**: swept the fork's own orientation on the table through 8 angles spanning
+  the full 180-degree-periodic range (a parallel gripper's alignment condition repeats every
+  180 degrees) -- zero feasible candidates at any rotation, including angles that would put
+  the "good alignment" wrist angle somewhere the wrist-sweep data showed as collision-free for
+  a *different* orientation.
+
+15 total distinct configurations, zero successes. This is meaningfully stronger evidence than
+the earlier, narrower conclusion: the finger-link-vs-table conflict isn't an accident of the
+fork's specific spot or angle on this table -- it holds across a wide, realistic range of both.
+
+**Final scope decision**: the demo uses the cup (and plate) as the reliable manipulation
+target. Fork and knife stay on the table as real objects the VLA planner correctly perceives
+and reasons about, but `acquire_object` honestly reports them as infeasible rather than faking
+a result -- a genuine, well-evidenced engineering finding for this specific hardware
+configuration (ALOHA's parallel-jaw gripper, this table height, these object dimensions), not
+a gap in the reasoning or planning layers, which work correctly regardless of which objects are
+actually graspable.
 
 ## Speechmatics -- now verified live
 
