@@ -101,13 +101,21 @@ async def _wav_chunks(path: Path, chunk_frames: int = 3200):
 
 
 async def run_voice(wav_file: Path):
-    transcript = None
+    # stream_transcripts yields one final transcript per recognized segment,
+    # not the whole utterance at once -- confirmed against real speech
+    # ("pick up the cup and move it closer to the plate" came back as 5
+    # separate chunks). Keeping only the last one (an earlier version of
+    # this function did) would have silently dropped most of any real
+    # instruction; every chunk has to be joined.
+    chunks = []
     async for text in stream_transcripts(_wav_chunks(wav_file)):
-        print(f"  transcript: {text}")
-        transcript = text
-    if transcript is None:
+        print(f"  transcript chunk: {text}")
+        chunks.append(text)
+    if not chunks:
         print("No transcript produced.")
         return
+    transcript = " ".join(chunks)
+    print(f"  full transcript: {transcript!r}")
     run(transcript)
 
 

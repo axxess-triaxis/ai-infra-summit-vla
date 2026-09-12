@@ -59,6 +59,15 @@ Rules:
   in that direction as that arm can actually reach (a modest shift), not the extreme opposite
   edge, since the arm doing the picking is also the one that has to reach the place target.
 - Use both arms in parallel where the instruction implies it (e.g. distinct objects, no shared target).
+- Choose the arm by which one is visually CLOSER to the object in the image: the left arm
+  appears on the left side of the image, the right arm on the right side. If the object is on
+  the right side of the image, the right arm should pick it, and vice versa.
+- The plate is too wide for the gripper to close around and must never be picked up -- if the
+  instruction mentions the plate (e.g. "move the cup closer to the plate"), only include steps
+  for the OTHER, smaller object, treating the plate as a fixed reference point/landmark, not
+  something to grasp.
+- Only include pick/place steps for objects the instruction actually asks to move -- do not add
+  extra steps for objects mentioned only as a reference point or location.
 - If the instruction is ambiguous or refers to an object not on the table, output an empty array [].
 - Output nothing except the JSON array -- no prose, no markdown fences.
 

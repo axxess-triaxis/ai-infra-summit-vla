@@ -48,10 +48,9 @@ typed text  ------------------------------- /              |
   reasoning while `control/` does deterministic "how to move it" is the scoped-realistic
   version of the same idea.
 - **`voice/speechmatics_client.py`** -- real-time transcription over Speechmatics'
-  WebSocket protocol. **Verified against a real key and account** (see "Speechmatics -- now
-  verified live" below) -- connects, authenticates, and completes the full message sequence
-  correctly. Not yet tested with real spoken words (only synthesized tones, to isolate
-  protocol correctness from transcription content).
+  WebSocket protocol. **Verified end to end with real spoken audio** (see "Full voice-to-action
+  pipeline" below) -- connects, authenticates, transcribes correctly, and feeds a real VLA plan
+  and grasp execution.
 - **`demo.py`** -- the single entrypoint, `--input text` or `--input voice`.
 
 ## Setup
@@ -452,9 +451,35 @@ header (no JWT exchange) is accepted, and the full message sequence
 -- confirmed by running the production client against both a raw protocol test and the real
 `stream_transcripts()` function with a synthesized WAV file, no exceptions, clean completion.
 Free tier: $100 credit, no card required, 2 concurrent real-time sessions -- sufficient for a
-demo. Not yet tested with real spoken words (only synthesized tones, to isolate protocol
-correctness from transcription content) -- that's the one remaining check before the actual demo
-recording.
+demo.
+
+## Full voice-to-action pipeline -- verified live end to end
+
+Tested with real spoken audio (Windows SAPI text-to-speech, resampled to 16kHz mono PCM16),
+not just synthesized tones: "Pick up the cup and move it closer to the plate" transcribed
+correctly via Speechmatics (streamed back as 5 partial chunks -- `"Pick"`, `"up the"`,
+`"cup and"`, `"move it"`, `"closer to the plate."` -- exactly matching what was spoken once
+joined), fed into the Groq-based VLA planner, and executed as a real physics grasp and
+placement. Found and fixed three real issues in the process, all from the very first live runs:
+
+1. **`demo.py`'s voice path kept only the LAST transcript chunk**, overwriting on each new one
+   (`transcript = text` in a loop) -- with real speech streaming back in multiple segments (as
+   confirmed above), this would have silently dropped most of any real spoken instruction. Fixed
+   to join every chunk.
+2. **Wrong-arm assignment**: given the same instruction, the planner assigned the LEFT arm to a
+   cup that was clearly on the RIGHT side of the frame (confirmed by inspecting `before.png`),
+   causing an out-of-reach grasp failure -- a real spatial-reasoning limitation of a fast, free
+   27B vision model, not a code bug. Mitigated at the prompt level: explicit "choose the arm
+   visually closer to the object in the image" guidance.
+3. **Spurious plate-manipulation step**: asked to move the cup "closer to the plate," the model
+   sometimes added an extra step to pick up the plate itself -- physically impossible (the
+   plate's 20cm diameter exceeds the gripper's ~7.4cm max opening) and something the prompt
+   never previously ruled out. Fixed with an explicit rule: the plate is a reference landmark,
+   never a pick target, plus "only include steps for objects the instruction actually asks to
+   move."
+
+Re-run 3/3 times after both fixes: correct arm every time, no spurious plate step, real grasp
+success every time -- confirmed reliable enough for a live demo, not just a lucky one-off.
 
 - **Object set is four primitives**, not photorealistic tableware meshes -- fine for a
   reasoning/manipulation demo, not for a visual polish pass.
